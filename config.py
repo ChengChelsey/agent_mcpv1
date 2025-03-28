@@ -13,6 +13,6 @@ WEIGHTS_MULTI = {
     "TrendSlope":         0.2
 }
 
-# 阈值：决定综合分数达到多少算高置信度异常
+#综合分数阈值
 HIGH_ANOMALY_THRESHOLD = 0.7
 MILD_ANOMALY_THRESHOLD = 0.4

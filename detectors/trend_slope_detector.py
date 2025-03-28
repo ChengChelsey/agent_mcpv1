@@ -18,17 +18,16 @@ def detect_trend_slope(series1, series2, window=5, slope_threshold=0.5):
 
     anomalies=[]
     scores=[]
-    # 用window做局部斜率
     for i in range(len(s1_sorted)-window+1):
         segment1 = s1_sorted[i:i+window]
-        # 同步 segment2
+        #同步 segment2
         seg2 = []
         for (ts,v1) in segment1:
             if ts in dict2:
                 seg2.append((ts, dict2[ts]))
         if len(seg2)<2:
             continue
-        # slope1
+        #slope1
         slope1 = (segment1[-1][1]-segment1[0][1])/(window-1)
         slope2 = (seg2[-1][1]-seg2[0][1])/(len(seg2)-1)
         ratio = 0.0

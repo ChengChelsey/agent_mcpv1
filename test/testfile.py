@@ -3,7 +3,6 @@ import os
 def dump_project_code(project_root, output_file="project_code_dump.txt"):
     with open(output_file, "w", encoding="utf-8") as out:
         for root, _, files in os.walk(project_root):
-            # 跳过 __pycache__
             if "__pycache__" in root:
                 continue
             for file in files:
@@ -15,6 +14,5 @@ def dump_project_code(project_root, output_file="project_code_dump.txt"):
                         out.write(f.read())
                     out.write("\n\n")
 
-# 使用示例：设定你的项目目录路径
-project_path = "/home/cnic/aiagent1"  # 修改成你的实际路径
+project_path = "/home/cnic/aiagent1"  
 dump_project_code(project_path)
