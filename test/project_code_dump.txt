@@ -480,18 +480,22 @@ def react(llm_text):
     if action and inp_str:
         try:
             action_input = json.loads(inp_str)
-        
-        # 检查是否存在时间占位符
-            for key in ["start", "end"]:
-                if key in action_input and isinstance(action_input[key], str):
-                    value = action_input[key]
-                # 检测占位符文本
-                    if "解析结果" in value or "待定" in value:
-                    # 提示用户指定时间
-                        return f"请提供具体的{key}时间（格式：YYYY-MM-DD HH:MM:SS）", False
         except:
             return f"无法解析调用参数JSON: {inp_str}", False
 
+        # 其他 action 保持不变
+        if action == "解析用户自然语言时间":
+            return parse_time_expressions(action_input["raw_text"]), False
+        if action == "请求智能运管后端Api，获取指标项的时序数据":
+            return get_monitor_metric_value(**action_input), False
+        if action == "请求智能运管后端Api，查询监控实例有哪些监控项":
+            return monitor_item_list(action_input["instance"]), False
+        elif action == "请求智能运管后端Api，查询监控服务的资产情况和监控实例":
+            return get_service_asset(action_input["service"]), False
+        elif action == "请求智能运管后端Api，查询监控实例之间的拓扑关联关系":
+            return get_service_asset_edges(action_input["service"], action_input["instance_ip"]), False
+        
+        
         if action == "单序列异常检测(文件)":
             result = single_series_detect(**action_input)
             if "error" in result:
@@ -515,6 +519,25 @@ def react(llm_text):
             return final_answer, False
 
         elif action == "多序列对比异常检测(文件)":
+            
+            sequence_nums = set()
+            for key in action_input.keys():
+                if key.startswith(('ip', 'field', 'start', 'end')) and len(key) > 2 and key[2:].isdigit():
+                    sequence_nums.add(int(key[2:]))
+            
+            if len(sequence_nums) > 2 or max(sequence_nums, default=0) > 2:
+                return "多序列对比异常检测工具目前一次只能对比两个序列。请先指定要对比的两个序列，之后可以进行其他序列的对比。", False
+            
+            required_pairs = [
+                ('ip1', 'field1', 'start1', 'end1'),
+                ('ip2', 'field2', 'start2', 'end2')
+            ]
+            
+            for pair in required_pairs:
+                if not all(param in action_input for param in pair):
+                    missing = [param for param in pair if param not in action_input]
+                    return f"缺少必要参数: {', '.join(missing)}", False
+
             result = multi_series_detect(**action_input)
             if "error" in result:
                 return result["error"], False
@@ -535,18 +558,6 @@ def react(llm_text):
 **图表路径**：{rep['report_path']}
 """
             return final_answer, False
-        
-        # 其他 action 保持不变
-        elif action == "解析用户自然语言时间":
-            return parse_time_expressions(action_input["raw_text"]), False
-        elif action == "请求智能运管后端Api，获取指标项的时序数据":
-            return get_monitor_metric_value(**action_input), False
-        elif action == "请求智能运管后端Api，查询监控实例有哪些监控项":
-            return monitor_item_list(action_input["instance"]), False
-        elif action == "请求智能运管后端Api，查询监控服务的资产情况和监控实例":
-            return get_service_asset(action_input["service"]), False
-        elif action == "请求智能运管后端Api，查询监控实例之间的拓扑关联关系":
-            return get_service_asset_edges(action_input["service"], action_input["instance_ip"]), False
         else:
             return f"未知工具调用: {action}", False
         
@@ -612,26 +623,15 @@ def chat(user_query):
     当前时间为: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
     处理规则：
-    1. 时间推理能力: 
-       当用户提到相对时间（如"上周星期一"、"上上周星期一"、"昨天"等），你必须根据当前时间自动计算出对应的具体日期，不要向用户提问确认。
-       -03-31（星期一），那么"上周星期一"就是2025-03-24，"上上周星期一"就是2025-03-17，"昨天"就是2025-03-30。
-       你应该具备日历计算能力，能够正确处理月末、闰年等特殊情况。
-       只有在时间表达式真正存在歧义（无法通过上下文或常识推断）时，才询问用户进一步澄清。
-       始终使用YYYY-MM-DD HH:MM:SS格式作为工具调用的参数。
-
-    2. 分析任务决策:
-       如果用户提供或暗示了1个时间区间，则调用'单序列异常检测(文件)'。
-       如果用户提供或暗示了多个时间区间，并且用户输入包含"对比"、"相比"、"比较"、"环比"、"VS"、"vs"、"变化"、"相较于"等明显比较词汇，则调用'多序列对比异常检测(文件)'。
-       如果用户提供或暗示了多个时间区间，但没有明确表示是要比较还是单独分析，在<补充请求>中询问用户意图。
-       如果用户要求分析多个不同指标或不同主机，应该分别进行分析，而不是拼接到一起。
-
-    3. 工作流程:
-       你每次只能调用一个工具，不能在同一次响应中调用多个工具。如果有多个任务，请分轮执行。
-       尽量减少不必要的补充请求。对用户意图应该有合理推断，不要过度询问。
-       不能伪造数据。如果某些数据无法获取，要清楚地告知用户。
-       对于时间表达式的解析，使用你自己的推理能力，而不仅仅依赖"解析用户自然语言时间"工具。
-
-    4.严格按照以下xml格式生成响应文本：
+    1.请根据当前时间来推断用户输入的具体日期。
+    2.如果用户输入1个时间区间，则调用'单序列异常检测(文件)'。
+    3.如果用户输入多个时间区间，但是没有明显的比较词汇，则要在<补充请求>里提问，示例:
+    <思考过程>我不知道用户是要对这些时间的数据分别进行单序列分析还是一起多序列分析，我需要确认</思考过程> <工具调用></工具调用> <调用参数></调用参数> <最终答案></最终答案> <补充请求>请问您是想对每段数据进行单序列分析，还是需要多序列的对比分析</补充请求> 
+    4.如过用户输入2个时间区间，并且用户输入包含"对比"、"相比"、"比较"、"环比"、"VS"、"vs"、"变化"、"相较于"等明显比较词汇，则调用'多序列对比异常检测(文件)'。
+    5.根据用户的输入来判断是否要调用工具以及调用哪个工具,判断不确定的时候可以使用<补充请求>来询问用户
+    6.你每次只能调用一个工具，不能在同一次响应中调用多个工具，如果有多个任务，请分轮执行。
+    7.不能伪造数据
+    8.严格按照以下xml格式生成响应文本：
     ```
     <思考过程>你的思考过程</思考过程>
     <工具调用>工具名称，不调用则为空</工具调用>
@@ -639,6 +639,12 @@ def chat(user_query):
     <最终答案>用户问题的最终结果（知道问题的最终答案时返回）</最终答案>
     <补充请求>系统请求用户补充信息</补充请求>
     ```
+    【重要的原则】：
+    1."解析用户自然语言时间"工具无法解析时间时，请你先自己根据当前时间和用户语义来计算正确的时间。
+    2.当你的工具调用遇到错误时（例如"无效的field"），你必须主动思考如何解决这个问题，而不是立即询问用户。
+    例如，如果出现"无效的field"错误，你应该自己主动调用"请求智能运管后端Api，查询监控实例有哪些监控项"工具来查询可用的监控项。
+    3.模糊的信息通过<补充请求>来询问用户，明确的信息直接调用工具。
+    
     '''
     history=[]
     history.append({"role":"system","content":system_prompt})
