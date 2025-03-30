@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>异常检测报告</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { padding: 20px; }
+        .iframe-container { width: 100%; height: 650px; border: none; }
+        .markdown-content { line-height: 1.6; }
+        .markdown-content h3 { margin-top: 20px; margin-bottom: 15px; color: #333; }
+        .markdown-content strong { font-weight: 600; color: #444; }
+        .tooltip-content { max-width: 300px; padding: 8px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="mt-4 mb-4">时序数据异常检测报告</h1>
+        
+        <div class="card mb-4">
+            <div class="card-header">
+                <strong>用户问题</strong>
+            </div>
+            <div class="card-body">
+                <p>分析 192.168.0.110 在 2025-03-17 00:00:00 ~ 2025-03-17 23:59:59 的 cpu_rate 数据</p>
+            </div>
+        </div>
+        
+        <div class="card mb-4">
+            <div class="card-header">
+                <strong>分析结论</strong>
+            </div>
+            <div class="card-body">
+                <div class="alert alert-success mb-3">
+                    <h4>综合判定: 正常</h4>
+                    <p>综合得分: 0.40</p>
+                </div>
+                <div class="markdown-content">
+                    <br>• <strong>Z-Score</strong>: 检测到 15 个异常点。 典型异常表现为: 10:20:00 - Z-Score=3.71，高于均值3.71个标准差; 11:20:00 - Z-Score=3.86，高于均值3.86个标准差; 12:10:00 - Z-Score=3.71，高于均值3.71个标准差; <br>- <strong>CUSUM</strong>: 检测到 1 个异常区间。 典型异常区间表现为: 12:20:00至12:25:00 - CUSUM值=7.31，累计偏移超过阈值(6.0); CUSUM值=6.25，累计偏移超过阈值(6.0); <br>- <strong>Hampel Filter</strong>: 检测到 14 个异常点。 典型异常表现为: 20:20:00 - 20:20:00: 值 2.10 高于局部中位数 (0.33) 119.38 个标准差; 11:20:00 - 11:20:00: 值 2.06 高于局部中位数 (0.39) 112.64 个标准差; 11:15:00 - 11:15:00: 值 1.31 高于局部中位数 (0.39) 62.05 个标准差; <br><br><strong>建议</strong>:<br>- 系统运行状态良好，可继续当前运维策略。<br>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mb-4">
+            <div class="card-header">
+                <strong>异常检测图表</strong>
+            </div>
+            <div class="card-body p-0">
+                <iframe class="iframe-container" src="summary.html" id="chartFrame"></iframe>
+            </div>
+        </div>
+        
+        <h2 class="mt-4 mb-3">检测方法摘要</h2>
+        
+        <div class="card mb-2">
+            <div class="card-header">
+                <strong>Z-Score</strong>
+            </div>
+            <div class="card-body">
+                <p>使用Z-Score方法(阈值=3.5)检测到15个异常点</p>
+            </div>
+        </div>
+        
+        <div class="card mb-2">
+            <div class="card-header">
+                <strong>CUSUM</strong>
+            </div>
+            <div class="card-body">
+                <p>CUSUM累积偏移检测到 1 个异常区段，共 2 个高偏移点</p>
+            </div>
+        </div>
+        
+        <div class="card mb-2">
+            <div class="card-header">
+                <strong>Hampel Filter</strong>
+            </div>
+            <div class="card-body">
+                <p>Hampel Filter (窗口=15, 阈值=5.0) 检测到 14 个异常点</p>
+            </div>
+        </div>
+        
+        
+        <footer class="mt-5 text-center text-muted">
+            <p>生成时间: 2025-03-31 00:17:39</p>
+        </footer>
+    </div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <!-- 传递tooltip数据到图表iframe的脚本 -->
+    <script type="text/javascript">
+        // 存储tooltip数据
+        const tooltipData = {"1": {"method": "Z-Score", "ts": 1742178000, "value": 2.0, "explanation": "Z-Score=3.71，高于均值3.71个标准差"}, "2": {"method": "Z-Score", "ts": 1742181600, "value": 2.06, "explanation": "Z-Score=3.86，高于均值3.86个标准差"}, "3": {"method": "Z-Score", "ts": 1742184600, "value": 2.0, "explanation": "Z-Score=3.71，高于均值3.71个标准差"}, "4": {"method": "Z-Score", "ts": 1742185200, "value": 2.11, "explanation": "Z-Score=3.98，高于均值3.98个标准差"}, "5": {"method": "Z-Score", "ts": 1742188800, "value": 1.97, "explanation": "Z-Score=3.64，高于均值3.64个标准差"}, "6": {"method": "Z-Score", "ts": 1742192400, "value": 2.06, "explanation": "Z-Score=3.86，高于均值3.86个标准差"}, "7": {"method": "Z-Score", "ts": 1742196000, "value": 2.02, "explanation": "Z-Score=3.76，高于均值3.76个标准差"}, "8": {"method": "Z-Score", "ts": 1742199600, "value": 1.97, "explanation": "Z-Score=3.64，高于均值3.64个标准差"}, "9": {"method": "Z-Score", "ts": 1742203200, "value": 2.02, "explanation": "Z-Score=3.76，高于均值3.76个标准差"}, "10": {"method": "Z-Score", "ts": 1742206800, "value": 1.95, "explanation": "Z-Score=3.59，高于均值3.59个标准差"}, "11": {"method": "Z-Score", "ts": 1742210400, "value": 2.04, "explanation": "Z-Score=3.81，高于均值3.81个标准差"}, "12": {"method": "Z-Score", "ts": 1742214000, "value": 2.1, "explanation": "Z-Score=3.96，高于均值3.96个标准差"}, "13": {"method": "Z-Score", "ts": 1742217600, "value": 2.1, "explanation": "Z-Score=3.96，高于均值3.96个标准差"}, "14": {"method": "Z-Score", "ts": 1742221200, "value": 2.09, "explanation": "Z-Score=3.93，高于均值3.93个标准差"}, "15": {"method": "Z-Score", "ts": 1742224800, "value": 1.96, "explanation": "Z-Score=3.61，高于均值3.61个标准差"}, "16": {"method": "CUSUM", "ts_start": 1742185200, "ts_end": 1742185500, "explanation": "CUSUM值=7.31，累计偏移超过阈值(6.0)"}, "17": {"method": "Hampel Filter", "ts": 1742214000, "value": 2.1, "explanation": "20:20:00: 值 2.10 高于局部中位数 (0.33) 119.38 个标准差"}, "18": {"method": "Hampel Filter", "ts": 1742181600, "value": 2.06, "explanation": "11:20:00: 值 2.06 高于局部中位数 (0.39) 112.64 个标准差"}, "19": {"method": "Hampel Filter", "ts": 1742181300, "value": 1.31, "explanation": "11:15:00: 值 1.31 高于局部中位数 (0.39) 62.05 个标准差"}, "20": {"method": "Hampel Filter", "ts": 1742221200, "value": 2.09, "explanation": "22:20:00: 值 2.09 高于局部中位数 (0.34) 59.02 个标准差"}, "21": {"method": "Hampel Filter", "ts": 1742210400, "value": 2.04, "explanation": "19:20:00: 值 2.04 高于局部中位数 (0.33) 57.67 个标准差"}, "22": {"method": "Hampel Filter", "ts": 1742192400, "value": 2.06, "explanation": "14:20:00: 值 2.06 高于局部中位数 (0.37) 56.99 个标准差"}, "23": {"method": "Hampel Filter", "ts": 1742206800, "value": 1.95, "explanation": "18:20:00: 值 1.95 高于局部中位数 (0.32) 54.97 个标准差"}, "24": {"method": "Hampel Filter", "ts": 1742224800, "value": 1.96, "explanation": "23:20:00: 值 1.96 高于局部中位数 (0.34) 54.63 个标准差"}, "25": {"method": "Hampel Filter", "ts": 1742184600, "value": 2.0, "explanation": "12:10:00: 值 2.00 高于局部中位数 (0.38) 54.63 个标准差"}, "26": {"method": "Hampel Filter", "ts": 1742199600, "value": 1.97, "explanation": "16:20:00: 值 1.97 高于局部中位数 (0.36) 54.30 个标准差"}, "27": {"method": "Hampel Filter", "ts": 1742178000, "value": 2.0, "explanation": "10:20:00: 值 2.00 高于局部中位数 (0.39) 54.30 个标准差"}, "28": {"method": "Hampel Filter", "ts": 1742188800, "value": 1.97, "explanation": "13:20:00: 值 1.97 高于局部中位数 (0.38) 53.62 个标准差"}, "29": {"method": "Hampel Filter", "ts": 1742217600, "value": 2.1, "explanation": "21:20:00: 值 2.10 高于局部中位数 (0.33) 39.79 个标准差"}, "30": {"method": "Hampel Filter", "ts": 1742185200, "value": 2.11, "explanation": "12:20:00: 值 2.11 高于局部中位数 (0.37) 39.12 个标准差"}};
+        
+        // 等待iframe加载
+        document.getElementById('chartFrame').onload = function() {
+            // 传递tooltip数据到图表iframe
+            this.contentWindow.postMessage({
+                type: 'tooltipData',
+                data: tooltipData
+            }, '*');
+        };
+    </script>
+</body>
+</html>

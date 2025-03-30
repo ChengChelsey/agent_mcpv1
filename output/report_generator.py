@@ -282,7 +282,6 @@ def generate_report_multi(series1, series2, ip1, ip2, field, user_query):
         "report_path": final_report_path,
         "analysis_text": analysis_text
     }
-
 def generate_report_single_series(user_query, chart_path, detection_results, tooltip_map, output_path, analysis_text=None, composite_score=0.0, classification="正常"):
     """
     生成单序列异常检测HTML报告
@@ -366,26 +365,13 @@ def generate_report_single_series(user_query, chart_path, detection_results, too
         """
     
     # 如果提供了分析文本，则转换成HTML格式
-    analysis_html = ""
+    formatted_text = ""
     if analysis_text:
         # 替换Markdown格式为HTML格式，避免使用复杂的f-string转义
         formatted_text = analysis_text.replace('\n', '<br>')
         formatted_text = re.sub(r'## (.*)', r'<h3>\1</h3>', formatted_text)
         formatted_text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', formatted_text)
         formatted_text = re.sub(r'- (.*)', r'• \1<br>', formatted_text)
-        
-        analysis_html = f"""
-        <div class="card mb-4">
-            <div class="card-header">
-                <strong>分析报告摘要</strong>
-            </div>
-            <div class="card-body">
-                <div class="markdown-content">
-                    {formatted_text}
-                </div>
-            </div>
-        </div>
-        """
     
     # 构建完整HTML报告
     html = f"""<!DOCTYPE html>
@@ -424,6 +410,11 @@ def generate_report_single_series(user_query, chart_path, detection_results, too
                     <h4>综合判定: {classification}</h4>
                     <p>综合得分: {composite_score:.2f}</p>
                 </div>
+                
+                <!-- 将分析报告摘要内容放到分析结论中 -->
+                <div class="markdown-content mt-3">
+                    {formatted_text if analysis_text else ""}
+                </div>
             </div>
         </div>
         
@@ -435,8 +426,6 @@ def generate_report_single_series(user_query, chart_path, detection_results, too
                 <iframe class="iframe-container" src="{os.path.basename(chart_path)}"></iframe>
             </div>
         </div>
-        
-        {analysis_html}
         
         <h2 class="mt-4 mb-3">异常点详细说明</h2>
         {anomaly_explanations_html}

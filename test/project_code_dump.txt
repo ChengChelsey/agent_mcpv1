@@ -28,6 +28,7 @@ import config
 import dateparser
 from django.conf import settings
 
+
 from analysis.single_series import analyze_single_series
 from analysis.multi_series import analyze_multi_series
 from output.report_generator import generate_report_single, generate_report_multi
@@ -41,6 +42,18 @@ CACHE_DIR = "cached_data"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 def _cache_filename(ip:str, start_ts:int, end_ts:int, field:str)->str:
+    """
+    生成缓存文件名（注意此函数的参数顺序必须保持不变）
+    
+    参数:
+        ip: 主机IP
+        start_ts: 开始时间戳
+        end_ts: 结束时间戳
+        field: 指标字段
+        
+    返回:
+        str: 缓存文件路径
+    """
     key = f"{ip}_{field}_{start_ts}_{end_ts}"  # 注意字段顺序
     h = hashlib.md5(key.encode('utf-8')).hexdigest()
     return os.path.join(CACHE_DIR, f"{h}.json")
@@ -292,55 +305,6 @@ tools = [
             },
             "required": ["ip1","field1","start1","end1","ip2","field2","start2","end2"]
         }
-    },
-     {
-        "name": "生成异常检测图表和报告(TaskPlan版)",
-        "description": "根据用户意图生成的 TaskPlan（分析计划），执行对应的异常检测任务，并生成图表和 HTML 报告。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "task_plan": {
-                    "type": "object",
-                    "description": "任务计划结构体，包含用户查询、任务类型、时间段、IP、字段等信息。",
-                    "properties": {
-                        "user_query": {"type": "string"},
-                        "output_dir": {"type": "string"},
-                        "tasks": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "task_id": {"type": "string"},
-                                    "task_type": {"type": "string", "enum": ["single", "pair", "multivariate"]},
-                                    "field": {"type": "string"},
-                                    "series": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "label": {"type": "string"},
-                                                "ip": {"type": "string"},
-                                                "field": {"type": "string"},
-                                                "start": {"type": "string"},
-                                                "end": {"type": "string"}
-                                            },
-                                            "required": ["ip", "start", "end"]
-                                        }
-                                    },
-                                    "enabled_methods": {
-                                        "type": "array",
-                                        "items": {"type": "string"}
-                                    }
-                                },
-                                "required": ["task_id", "task_type", "field", "series"]
-                            }
-                        }
-                    },
-                    "required": ["user_query", "tasks"]
-                }
-            },
-            "required": ["task_plan"]
-        }
     }
 ]
 
@@ -384,7 +348,6 @@ def get_service_asset_edges(service, instance_ip):
     else:
         return f"查询拓扑失败: {resp.status_code} => {resp.text}"
     
-
 def get_monitor_metric_value(ip, start, end, field):
     import datetime
     def to_int(s):
@@ -529,15 +492,6 @@ def react(llm_text):
         except:
             return f"无法解析调用参数JSON: {inp_str}", False
 
-        # 检查IP是否为待定或空
-        if action in ["单序列异常检测(文件)", "多序列对比异常检测(文件)"]:
-            if action_input.get("ip", "") in ["待定", ""]:
-                return "请提供要分析的具体IP地址", False
-            
-            # 对于多序列分析，同时检查第二个IP
-            if action == "多序列对比异常检测(文件)" and action_input.get("ip2", "") in ["待定", ""]:
-                return "请提供第二个要分析的具体IP地址", False
-
         if action == "单序列异常检测(文件)":
             result = single_series_detect(**action_input)
             if "error" in result:
@@ -581,7 +535,7 @@ def react(llm_text):
 **图表路径**：{rep['report_path']}
 """
             return final_answer, False
-
+        
         # 其他 action 保持不变
         elif action == "解析用户自然语言时间":
             return parse_time_expressions(action_input["raw_text"]), False
@@ -658,15 +612,26 @@ def chat(user_query):
     当前时间为: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
     处理规则：
-    1.请根据当前时间来推断用户输入的时间区间的具体值。当你解析时间表达式后，请使用start_str和end_str字段中的具体时间值作为后续调用的时间参数，避免使用"解析结果中的start时间"这样的占位符。
-    2.如 parse_time_expressions 只返回1个时间区间，则调用'单序列异常检测(文件)'。
-    3.如 parse_time_expressions 返回2个时间区间，并且用户输入包含"对比"、"相比"、"比较"、"环比"、"VS"、"vs"、"变化"、"相较于"等明显比较词汇，则调用'多序列对比异常检测(文件)'。
-    4.若parse_time_expressions 返回超过1个时间区间，但是没有明显的比较词汇，可先在<补充请求>里提问，示例:
-    <思考过程>我不知道用户是要对这些时间的数据分别进行单序列分析还是一起多序列分析，我需要确认</思考过程> <工具调用></工具调用> <调用参数></调用参数> <最终答案></最终答案> <补充请求>请问您是想对每段数据进行单序列分析，还是需要多序列的对比分析</补充请求> 
-    5.根据用户的输入来判断是否要调用工具以及调用哪个工具,判断不确定的时候可以使用<补充请求>来询问用户
-    6.你每次只能调用一个工具，不能在同一次响应中调用多个工具，如果有多个任务，请分轮执行。尽量减少不必要的补充请求。
-    7.不能伪造数据
-    8.严格按照以下xml格式生成响应文本：
+    1. 时间推理能力: 
+       当用户提到相对时间（如"上周星期一"、"上上周星期一"、"昨天"等），你必须根据当前时间自动计算出对应的具体日期，不要向用户提问确认。
+       -03-31（星期一），那么"上周星期一"就是2025-03-24，"上上周星期一"就是2025-03-17，"昨天"就是2025-03-30。
+       你应该具备日历计算能力，能够正确处理月末、闰年等特殊情况。
+       只有在时间表达式真正存在歧义（无法通过上下文或常识推断）时，才询问用户进一步澄清。
+       始终使用YYYY-MM-DD HH:MM:SS格式作为工具调用的参数。
+
+    2. 分析任务决策:
+       如果用户提供或暗示了1个时间区间，则调用'单序列异常检测(文件)'。
+       如果用户提供或暗示了多个时间区间，并且用户输入包含"对比"、"相比"、"比较"、"环比"、"VS"、"vs"、"变化"、"相较于"等明显比较词汇，则调用'多序列对比异常检测(文件)'。
+       如果用户提供或暗示了多个时间区间，但没有明确表示是要比较还是单独分析，在<补充请求>中询问用户意图。
+       如果用户要求分析多个不同指标或不同主机，应该分别进行分析，而不是拼接到一起。
+
+    3. 工作流程:
+       你每次只能调用一个工具，不能在同一次响应中调用多个工具。如果有多个任务，请分轮执行。
+       尽量减少不必要的补充请求。对用户意图应该有合理推断，不要过度询问。
+       不能伪造数据。如果某些数据无法获取，要清楚地告知用户。
+       对于时间表达式的解析，使用你自己的推理能力，而不仅仅依赖"解析用户自然语言时间"工具。
+
+    4.严格按照以下xml格式生成响应文本：
     ```
     <思考过程>你的思考过程</思考过程>
     <工具调用>工具名称，不调用则为空</工具调用>
@@ -682,6 +647,7 @@ def chat(user_query):
     round_num=1
     max_round=15
     pending_context = None 
+    had_supplement = False
 
     while True:
         print(f"=== 第{round_num}轮对话 ===")
@@ -706,8 +672,11 @@ def chat(user_query):
         if isinstance(res, dict) and res.get("type") == "supplement":
             print(f"\n小助手: {res['content']}")
             user_input = input("你: ")
-            history.append({"role": "user", "content": user_input})
-            pending_context = {"history": history.copy()}
+            
+            supplement_response = f"对于您的问题 '{res['content']}'，我的回答是: {user_input}"
+            history.append({"role": "user", "content": supplement_response})
+            
+            had_supplement = True
             round_num += 1
             continue
 
@@ -734,7 +703,7 @@ def chat(user_query):
 if __name__ == '__main__':
     # chat('你好')
     chat(
-        '请分析192.168.0.110这台主机这周星期一和上周星期一还有昨天的cpu利用率，并作图给出分析报告')
+        '请分析192.168.0.110这台主机上周星期一和上上周星期一的cpu利用率还有昨天的用户cpu利用率，并作图给出分析报告')
 
 
 # === config.py ===
@@ -752,12 +721,8 @@ logger = logging.getLogger("anomaly_detection")
 
 # 各个检测方法的权重配置 - 调整权重使得结果更合理
 WEIGHTS_SINGLE = {
-    "Z-Score": 0.25,
-    "CUSUM": 0.25,
-    "STL": 0.5,
-    # 备选方法
-    "STL-Simplified": 0.4,
-    "STL-Fallback": 0.2
+    "Z-Score": 0.5,
+    "CUSUM": 0.5
 }
 
 WEIGHTS_MULTI = {
@@ -779,16 +744,6 @@ DEFAULT_THRESHOLD_CONFIG = {
     "CUSUM": {
         "drift_threshold": 6.0,  # 增大偏移阈值
         "k": 0.7  # 增大k值，减少对小波动的敏感度
-    },
-    "STL": {
-        "seasonal": 24,  # 更合理的季节周期（24小时）
-        "z_threshold": 3.5  # 增大阈值
-    },
-    "STL-Simplified": {
-        "z_threshold": 3.5
-    },
-    "STL-Fallback": {
-        "threshold": 3.5
     },
     "ResidualComparison": {
         "threshold": 3.5
@@ -843,213 +798,6 @@ DB_CONFIG = {
     'PASSWORD': 'aiops123',
     'NAME': 'aiops_monitoring'
 }
-
-# === tools/report_from_plan.py ===
-# tools/report_from_plan.py
-import os
-import pickle
-import time
-import json
-from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
-
-# 导入任务计划类
-from tools.task_plan import SeriesInfo, TaskConfig, TaskPlan
-
-# 导入检测器
-from detectors import (
-    ZScoreDetector,
-    STLDetector,
-    CUSUMDetector,
-    ResidualComparisonDetector,
-    TrendDriftCUSUMDetector,
-    ChangeRateDetector,
-    TrendSlopeDetector
-)
-
-# 导入可视化和报告生成模块
-from output.visualization import generate_summary_echarts_html
-from output.report_generator import generate_report_single_series
-
-# 导入工具函数
-from utils.ts_cache import ensure_cache_file, load_series_from_cache
-
-def run_task_and_generate_report(task_plan_dict: dict) -> dict:
-    """
-    根据TaskPlan执行异常检测任务并生成可视化报告
-    
-    参数:
-        task_plan_dict: TaskPlan字典定义
-        
-    返回:
-        dict: 包含执行结果路径和摘要
-    """
-    # 解析任务计划
-    plan = TaskPlan.from_dict(task_plan_dict)
-    result_paths = []
-    
-    # 遍历执行每个任务
-    for task in plan.tasks:
-        # 创建任务输出目录
-        ts = int(time.time())
-        task_dir = os.path.join(plan.output_dir, f"{task.task_id}_{ts}")
-        os.makedirs(task_dir, exist_ok=True)
-        
-        # 处理单序列异常检测任务
-        if task.task_type == "single":
-            # 加载数据
-            s = task.series[0]
-            series = load_series_from_cache(s.ip, s.field, s.start, s.end)
-            
-            # 执行检测
-            results = [
-                ZScoreDetector().detect(series),
-                STLDetector().detect(series),
-                CUSUMDetector().detect(series)
-            ]
-            
-            # 筛选启用的方法（如果指定）
-            if task.enabled_methods:
-                results = [r for r in results if r.method in task.enabled_methods]
-            
-            # 生成图表和报告
-            chart_path = os.path.join(task_dir, "chart.html")
-            html_path = os.path.join(task_dir, "final_report.html")
-            
-            # 汇总可视化
-            chart_path, tooltip_map = generate_summary_echarts_html(
-                series, results, chart_path, 
-                title=f"{s.ip} {s.field} 异常检测汇总图"
-            )
-            
-            # 生成报告
-            generate_report_single_series(
-                plan.user_query, chart_path, results, tooltip_map, html_path
-            )
-            
-            result_paths.append(html_path)
-            
-        # 处理多序列对比检测任务
-        elif task.task_type == "pair":
-            # 加载两个序列数据
-            s1, s2 = task.series
-            series1 = load_series_from_cache(s1.ip, s1.field, s1.start, s1.end)
-            series2 = load_series_from_cache(s2.ip, s2.field, s2.start, s2.end)
-            
-            # 执行对比检测
-            results = [
-                ResidualComparisonDetector().detect(series1, series2),
-                TrendDriftCUSUMDetector().detect(series1, series2),
-                ChangeRateDetector().detect(series1, series2),
-                TrendSlopeDetector().detect(series1, series2)
-            ]
-            
-            # 筛选启用的方法（如果指定）
-            if task.enabled_methods:
-                results = [r for r in results if r.method in task.enabled_methods]
-            
-            # 生成图表和报告
-            chart_path = os.path.join(task_dir, "chart.html")
-            html_path = os.path.join(task_dir, "final_report.html")
-            
-            # 汇总可视化 - 为多序列对比实现特殊版本
-            chart_path, tooltip_map = generate_summary_echarts_html(
-                series1, results, chart_path,
-                title=f"{s1.ip} vs {s2.ip} 对比异常检测汇总图"
-            )
-            
-            # 生成报告
-            generate_report_single_series(
-                plan.user_query, chart_path, results, tooltip_map, html_path
-            )
-            
-            result_paths.append(html_path)
-            
-        # 暂不支持的任务类型
-        else:
-            print(f"[跳过] 暂不支持的 task_type: {task.task_type}")
-    
-    # 返回汇总结果
-    return {
-        "user_query": plan.user_query,
-        "summary": f"已完成 {len(result_paths)} 个任务的图表与报告生成。",
-        "report_paths": result_paths
-    }
-
-# === tools/task_plan.py ===
-# agent/tools/task_plan.py
-from typing import List, Optional
-
-class SeriesInfo:
-    def __init__(self, label: str, ip: str, field: str, start: str, end: str):
-        self.label = label                # 用户层面的标签（如“昨天”、“这周一”）
-        self.ip = ip                      # 数据源IP
-        self.field = field                # 指标名称（如 'cpu_rate'）
-        self.start = start                # 开始时间（'2025-03-27 00:00:00'）
-        self.end = end                    # 结束时间
-
-class TaskConfig:
-    def __init__(
-        self,
-        task_id: str,
-        task_type: str,                  # "single", "pair", "multivariate"
-        field: str,
-        series: List[SeriesInfo],
-        enabled_methods: Optional[List[str]] = None,
-        target_report_path: Optional[str] = None
-    ):
-        self.task_id = task_id
-        self.task_type = task_type
-        self.field = field
-        self.series = series
-        self.enabled_methods = enabled_methods or []
-        self.target_report_path = target_report_path
-
-class TaskPlan:
-    def __init__(
-        self,
-        user_query: str,
-        tasks: List[TaskConfig],
-        output_dir: str = "output/plots"
-    ):
-        self.user_query = user_query
-        self.tasks = tasks
-        self.output_dir = output_dir
-
-    @staticmethod
-    def from_dict(plan_dict: dict) -> "TaskPlan":
-        return TaskPlan(
-            user_query=plan_dict["user_query"],
-            output_dir=plan_dict.get("output_dir", "output/plots"),
-            tasks=[
-                TaskConfig(
-                    task_id=task["task_id"],
-                    task_type=task["task_type"],
-                    field=task["field"],
-                    series=[
-                        SeriesInfo(
-                            label=series.get("label", ""),
-                            ip=series["ip"],
-                            field=series.get("field", task["field"]),
-                            start=series["start"],
-                            end=series["end"]
-                        ) for series in task["series"]
-                    ],
-                    enabled_methods=task.get("enabled_methods"),
-                    target_report_path=task.get("target_report_path")
-                )
-                for task in plan_dict["tasks"]
-            ]
-        )
-
-
-# === tools/__init__.py ===
-# tools/__init__.py
-"""
-工具模块，包含任务计划和基于计划的报告生成功能
-"""
-
-from tools.task_plan import SeriesInfo, TaskConfig, TaskPlan
 
 # === utils/ts_cache.py ===
 # utils/ts_cache.py
@@ -1532,7 +1280,6 @@ def generate_report_multi(series1, series2, ip1, ip2, field, user_query):
         "report_path": final_report_path,
         "analysis_text": analysis_text
     }
-
 def generate_report_single_series(user_query, chart_path, detection_results, tooltip_map, output_path, analysis_text=None, composite_score=0.0, classification="正常"):
     """
     生成单序列异常检测HTML报告
@@ -1616,26 +1363,13 @@ def generate_report_single_series(user_query, chart_path, detection_results, too
         """
     
     # 如果提供了分析文本，则转换成HTML格式
-    analysis_html = ""
+    formatted_text = ""
     if analysis_text:
         # 替换Markdown格式为HTML格式，避免使用复杂的f-string转义
         formatted_text = analysis_text.replace('\n', '<br>')
         formatted_text = re.sub(r'## (.*)', r'<h3>\1</h3>', formatted_text)
         formatted_text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', formatted_text)
         formatted_text = re.sub(r'- (.*)', r'• \1<br>', formatted_text)
-        
-        analysis_html = f"""
-        <div class="card mb-4">
-            <div class="card-header">
-                <strong>分析报告摘要</strong>
-            </div>
-            <div class="card-body">
-                <div class="markdown-content">
-                    {formatted_text}
-                </div>
-            </div>
-        </div>
-        """
     
     # 构建完整HTML报告
     html = f"""<!DOCTYPE html>
@@ -1674,6 +1408,11 @@ def generate_report_single_series(user_query, chart_path, detection_results, too
                     <h4>综合判定: {classification}</h4>
                     <p>综合得分: {composite_score:.2f}</p>
                 </div>
+                
+                <!-- 将分析报告摘要内容放到分析结论中 -->
+                <div class="markdown-content mt-3">
+                    {formatted_text if analysis_text else ""}
+                </div>
             </div>
         </div>
         
@@ -1685,8 +1424,6 @@ def generate_report_single_series(user_query, chart_path, detection_results, too
                 <iframe class="iframe-container" src="{os.path.basename(chart_path)}"></iframe>
             </div>
         </div>
-        
-        {analysis_html}
         
         <h2 class="mt-4 mb-3">异常点详细说明</h2>
         {anomaly_explanations_html}
@@ -2825,7 +2562,6 @@ def analyze_single_series(series):
     # 导入检测器
     from detectors.zscore import ZScoreDetector
     from detectors.cusum import CUSUMDetector
-    from detectors.stl_detector import STLDetector
     
     # 加载阈值配置
     thres = config.THRESHOLD_CONFIG
@@ -2851,40 +2587,29 @@ def analyze_single_series(series):
         logger.error(f"CUSUM 检测失败: {e}")
         res_cusum = DetectionResult(method="CUSUM", description=f"检测失败: {e}")
     
-    # 执行异常检测 - STL
-    try:
-        res_stl = STLDetector(
-            seasonal=thres.get("STL", {}).get("seasonal", 24),
-            z_threshold=thres.get("STL", {}).get("z_threshold", 3.5)
-        ).detect(series)
-        logger.info(f"STL 检测到 {len(res_stl.anomalies)} 个异常点")
-    except Exception as e:
-        logger.error(f"STL 检测失败: {e}")
-        res_stl = DetectionResult(method="STL", description=f"检测失败: {e}")
-    
     # 检查是否所有方法都失败了
     valid_results = []
-    for result in [res_z, res_cusum, res_stl]:
+    for result in [res_z, res_cusum]:
         if len(result.anomalies) > 0 or len(result.intervals) > 0 or result.visual_type != "none":
             valid_results.append(result)
     
     if not valid_results:
         logger.warning("所有检测方法都未找到异常或失败")
         return {
-            "method_results": [res_z, res_cusum, res_stl],
+            "method_results": [res_z, res_cusum],
             "composite_score": 0,
             "classification": "正常",
             "anomaly_times": []
         }
     
-    # 避免STL和Z-Score重复计算
+    # 避免重复计算
     method_results = []
     method_names = set()
     
-    for result in [res_z, res_cusum, res_stl]:
+    for result in [res_z, res_cusum]:
         # 跳过重复方法
-        if result.method == "STL-Fallback" and "Z-Score" in method_names:
-            logger.info("跳过与Z-Score重复的STL回退结果")
+        if result.method in method_names:
+            logger.info(f"跳过重复的 {result.method} 结果")
             continue
         method_results.append(result)
         method_names.add(result.method)
@@ -3144,308 +2869,6 @@ def formatted_timestamp(ts):
     except:
         return str(ts)
 
-# === detectors/stl_detector.py ===
-# detectors/stl_detector.py
-import numpy as np
-import traceback
-from typing import List, Tuple, Optional
-from statsmodels.tsa.seasonal import STL
-from detectors.base import DetectionResult
-
-class STLDetector:
-    """
-    使用STL (Season-Trend-Loess) 分解的异常检测器
-    """
-    def __init__(self, seasonal: int = 24, z_threshold: float = 3.0):
-        """
-        初始化STL检测器
-        
-        参数:
-            seasonal: 季节性周期长度，默认为24（假设每小时的数据有天周期）
-            z_threshold: 残差Z-Score阈值
-        """
-        self.seasonal = seasonal
-        self.z_threshold = z_threshold
-    
-    def detect(self, series: List[Tuple[int, float]]) -> DetectionResult:
-        """对时间序列执行STL分解检测"""
-        if not series:
-            return DetectionResult(method="STL", description="无数据进行STL分解", visual_type="none")
-            
-        # 提取时间戳和值
-        timestamps = [t for t, _ in series]
-        values = np.array([v for _, v in series])
-        
-        # 基础验证：检查数据长度
-        if len(values) < 2:
-            print(f"STL 数据点数不足: {len(values)}")
-            return DetectionResult(
-                method="STL", 
-                description="数据点数不足以进行分析",
-                visual_type="none"
-            )
-            
-        # 验证：检查是否存在非法值
-        if np.isnan(values).any() or np.isinf(values).any():
-            # 清理非法值
-            is_valid = ~(np.isnan(values) | np.isinf(values))
-            if np.sum(is_valid) < len(values) * 0.9:  # 如果有效数据不足90%
-                print(f"STL 数据含有过多无效值: {len(values) - np.sum(is_valid)} / {len(values)}")
-                return DetectionResult(
-                    method="STL", 
-                    description="数据含有过多无效值，无法分析",
-                    visual_type="none"
-                )
-            # 替换无效值
-            valid_mean = np.mean(values[is_valid])
-            values_clean = np.copy(values)
-            values_clean[~is_valid] = valid_mean
-            values = values_clean
-        
-        # 验证：几乎不变的数据
-        value_range = np.max(values) - np.min(values)
-        if value_range < 1e-6 or np.std(values) < 1e-6:
-            print("STL 数据几乎不变")
-            return DetectionResult(
-                method="STL", 
-                description="数据几乎不变，无需进行异常检测",
-                visual_type="none"
-            )
-            
-        # 尝试自动确定合适的季节性参数
-        def estimate_seasonality(ts_values, ts_timestamps):
-            """估计时间序列的季节性周期"""
-            try:
-                # 检查采样间隔
-                if len(ts_timestamps) < 2:
-                    return max(2, min(len(ts_values) // 4, 10))
-                    
-                intervals = [ts_timestamps[i+1] - ts_timestamps[i] for i in range(len(ts_timestamps)-1)]
-                if not intervals:
-                    return 2  # 默认最小季节性
-                    
-                median_interval = sorted(intervals)[len(intervals)//2]
-                print(f"数据点的中位数时间间隔: {median_interval} 秒")
-                
-                # 数据量太少，使用默认值
-                if len(ts_values) < 48:
-                    return max(3, min(len(ts_values) // 4, 11))  # 确保是奇数
-                
-                # 常见周期性估计
-                if 3500 <= median_interval <= 3700:  # ~1小时
-                    # 对于小时级数据，根据数据长度估计
-                    if len(ts_values) >= 48:  # 超过2天的数据
-                        return 24  # 一天的周期
-                    else:
-                        return max(3, len(ts_values) // 4)
-                elif 80000 <= median_interval <= 90000:  # ~1天
-                    return 7  # 一周的周期
-                elif 290000 <= median_interval <= 310000:  # ~3-4天
-                    return 4  # 约2周一个周期
-                else:
-                    # 如果有固定模式的峰值（例如每小时定时任务）
-                    # 尝试检测这种模式
-                    try:
-                        # 获取峰值
-                        peaks = []
-                        for i in range(1, len(ts_values)-1):
-                            if ts_values[i] > ts_values[i-1] and ts_values[i] > ts_values[i+1]:
-                                if ts_values[i] > np.mean(ts_values) + 1.5 * np.std(ts_values):
-                                    peaks.append(i)
-                        
-                        if len(peaks) >= 3:
-                            # 计算峰值之间的间隔
-                            peak_intervals = [peaks[i+1] - peaks[i] for i in range(len(peaks)-1)]
-                            if peak_intervals:
-                                avg_interval = sum(peak_intervals) / len(peak_intervals)
-                                print(f"检测到明显的峰值模式，平均间隔: {avg_interval} 个点")
-                                if 10 <= avg_interval <= 20:
-                                    return int(avg_interval)
-                    except Exception as e:
-                        print(f"峰值检测失败: {e}")
-                    
-                    # 使用默认值（奇数）
-                    default_seasonal = max(3, min(len(ts_values) // 8, 23))
-                    # 确保是奇数
-                    if default_seasonal % 2 == 0:
-                        default_seasonal += 1
-                    return default_seasonal
-            except Exception as e:
-                print(f"季节性估计错误: {e}")
-                # 返回奇数值
-                default_val = max(3, min(len(ts_values) // 6, 11))
-                return default_val if default_val % 2 == 1 else default_val + 1
-        
-        try:
-            # 一、尝试使用更适合的季节性参数
-            if self.seasonal < 2 or self.seasonal > len(values) // 2:
-                estimated_seasonal = estimate_seasonality(values, timestamps)
-                print(f"自动估计的季节性参数: {estimated_seasonal}")
-                # 确保季节性参数在合理范围
-                self.seasonal = max(2, min(estimated_seasonal, len(values) // 2))
-                # 确保季节性参数是奇数，以便于简化分析
-                if self.seasonal % 2 == 0:
-                    self.seasonal += 1
-                print(f"最终使用的季节性参数: {self.seasonal}")
-            
-            # 如果数据不足以执行标准STL (至少需要2*seasonal的数据)
-            if len(values) < 2 * self.seasonal:
-                print(f"数据长度({len(values)})不足以进行STL分解(需要至少{2*self.seasonal}点)")
-                # 使用简化季节性分解
-                return self._perform_simplified_analysis(timestamps, values)
-                
-            # 二、尝试不同配置进行STL分解
-            stl_result = None
-            stl_error = None
-            
-            # 尝试的参数组合
-            param_combinations = [
-                # 周期性参数, 鲁棒性, 周期性平滑度
-                (self.seasonal, True, None),
-                (self.seasonal, False, None),
-                (max(2, self.seasonal // 2), True, None),
-                (max(2, self.seasonal // 2), False, None),
-                (max(2, self.seasonal * 2), True, None)
-            ]
-            
-            for seasonal_param, robust_param, seasonal_deg in param_combinations:
-                try:
-                    stl_config = {
-                        'seasonal': seasonal_param,
-                        'robust': robust_param
-                    }
-                    if seasonal_deg is not None:
-                        stl_config['seasonal_deg'] = seasonal_deg
-                        
-                    print(f"尝试STL配置: {stl_config}")
-                    stl = STL(values, **stl_config)
-                    stl_result = stl.fit()
-                    print(f"STL分解成功，使用配置: {stl_config}")
-                    break  # 成功找到可行配置
-                except Exception as e:
-                    stl_error = str(e)
-                    print(f"STL配置 {stl_config} 失败: {e}")
-                    continue
-                    
-            # 如果所有STL配置都失败
-            if stl_result is None:
-                print(f"所有STL配置都失败，最后错误: {stl_error}")
-                return self._perform_simplified_analysis(timestamps, values)
-                
-            # 三、成功执行STL分解，计算残差异常
-            resid = stl_result.resid
-            
-            # 计算残差的Z-Score
-            resid_mean = np.mean(resid)
-            resid_std = np.std(resid) if np.std(resid) > 0 else 1.0
-            resid_z = (resid - resid_mean) / resid_std
-            
-            # 找出残差超过阈值的异常点
-            anomalies = []
-            scores = []
-            explanations = []
-            
-            for i, z in enumerate(resid_z):
-                if abs(z) > self.z_threshold:
-                    anomalies.append(timestamps[i])
-                    scores.append(float(abs(z)))
-                    direction = "高于" if z > 0 else "低于"
-                    explanations.append(f"STL残差Z-Score={z:.2f}，该点{direction}预期值{abs(z):.2f}个标准差")
-            
-            # 构建残差曲线
-            resid_curve = [(timestamps[i], float(resid[i])) for i in range(len(timestamps))]
-            
-            return DetectionResult(
-                method="STL",
-                anomalies=anomalies,
-                anomaly_scores=scores,
-                auxiliary_curve=resid_curve,
-                description=f"STL分解(季节性周期={self.seasonal}) + 残差Z-Score(阈值={self.z_threshold})检测到{len(anomalies)}个异常点",
-                visual_type="point",
-                explanation=explanations
-            )
-            
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"STL分解失败: {e}\n{tb}")
-            return self._perform_simplified_analysis(timestamps, values)
-    
-    def _perform_simplified_analysis(self, timestamps, values):
-        """
-        当STL分解失败时使用简化的分析方法
-        """
-        try:
-            print("使用简化的滑动窗口分析作为替代")
-            # 使用简单的移动平均作为替代方法
-            window_size = max(3, min(self.seasonal, len(values) // 3))
-            # 确保窗口大小是奇数
-            if window_size % 2 == 0:
-                window_size += 1
-            
-            print(f"使用窗口大小: {window_size}")
-            
-            # 使用简单的移动平均作为趋势
-            try:
-                # 首先尝试scipy的medfilt
-                from scipy.signal import medfilt
-                padded_values = np.pad(values, (window_size//2, window_size//2), mode='edge')
-                trend = medfilt(padded_values, kernel_size=window_size)[window_size//2:window_size//2+len(values)]
-            except Exception as e:
-                print(f"中值滤波失败: {e}，使用滑动平均")
-                # 如果失败，使用手动实现的滑动平均
-                trend = np.zeros_like(values)
-                half_window = window_size // 2
-                
-                for i in range(len(values)):
-                    start = max(0, i - half_window)
-                    end = min(len(values), i + half_window + 1)
-                    trend[i] = np.mean(values[start:end])
-            
-            # 计算残差
-            residuals = values - trend
-            
-            # 计算残差Z-Score
-            resid_mean = np.mean(residuals)
-            resid_std = np.std(residuals) if np.std(residuals) > 0 else 1.0
-            resid_z = (residuals - resid_mean) / resid_std
-            
-            # 找出异常点
-            anomalies = []
-            scores = []
-            explanations = []
-            
-            for i, z in enumerate(resid_z):
-                if abs(z) > self.z_threshold:
-                    anomalies.append(timestamps[i])
-                    scores.append(float(abs(z)))
-                    direction = "高于" if z > 0 else "低于"
-                    explanations.append(f"简化残差Z-Score={z:.2f}，该点{direction}趋势{abs(z):.2f}个标准差")
-            
-            # 构建残差曲线
-            resid_curve = [(timestamps[i], float(residuals[i])) for i in range(len(timestamps))]
-            
-            return DetectionResult(
-                method="STL-Simplified",
-                anomalies=anomalies,
-                anomaly_scores=scores,
-                auxiliary_curve=resid_curve,
-                description=f"简化滑动窗口分析(窗口={window_size})检测到{len(anomalies)}个异常点",
-                visual_type="point",
-                explanation=explanations
-            )
-            
-        except Exception as e:
-            print(f"简化分析也失败了: {e}")
-            # 最后的后备方案：使用Z-Score
-            from detectors.zscore import ZScoreDetector
-            zscore_result = ZScoreDetector(threshold=self.z_threshold).detect(list(zip(timestamps, values)))
-            
-            # 确保不重复Z-Score结果
-            zscore_result.method = "STL-Fallback"
-            zscore_result.description = f"STL分解失败，使用Z-Score作为替代方法"
-            
-            return zscore_result
-
 # === detectors/base.py ===
 # detectors/base.py
 from typing import List, Tuple, Optional, Dict, Any, Union
@@ -3615,7 +3038,6 @@ class ZScoreDetector:
 # 明确导出检测器类以简化导入
 from detectors.zscore import ZScoreDetector
 from detectors.cusum import CUSUMDetector
-from detectors.stl_detector import STLDetector
 from detectors.residual_comparison import ResidualComparisonDetector
 from detectors.trend_drift_cusum import TrendDriftCUSUMDetector
 from detectors.change_rate import ChangeRateDetector
@@ -3625,7 +3047,6 @@ from detectors.base import DetectionResult
 # 为向后兼容性导出旧的函数名
 from detectors.zscore import ZScoreDetector as detect_zscore
 from detectors.cusum import CUSUMDetector as detect_cusum
-from detectors.stl_detector import STLDetector as detect_stl_residual
 from detectors.residual_comparison import ResidualComparisonDetector as detect_residual_compare
 from detectors.trend_drift_cusum import TrendDriftCUSUMDetector as detect_trend_drift
 from detectors.change_rate import ChangeRateDetector as detect_change_rate

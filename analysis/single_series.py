@@ -39,7 +39,6 @@ def analyze_single_series(series):
     # 导入检测器
     from detectors.zscore import ZScoreDetector
     from detectors.cusum import CUSUMDetector
-    from detectors.stl_detector import STLDetector
     
     # 加载阈值配置
     thres = config.THRESHOLD_CONFIG
@@ -65,40 +64,29 @@ def analyze_single_series(series):
         logger.error(f"CUSUM 检测失败: {e}")
         res_cusum = DetectionResult(method="CUSUM", description=f"检测失败: {e}")
     
-    # 执行异常检测 - STL
-    try:
-        res_stl = STLDetector(
-            seasonal=thres.get("STL", {}).get("seasonal", 24),
-            z_threshold=thres.get("STL", {}).get("z_threshold", 3.5)
-        ).detect(series)
-        logger.info(f"STL 检测到 {len(res_stl.anomalies)} 个异常点")
-    except Exception as e:
-        logger.error(f"STL 检测失败: {e}")
-        res_stl = DetectionResult(method="STL", description=f"检测失败: {e}")
-    
     # 检查是否所有方法都失败了
     valid_results = []
-    for result in [res_z, res_cusum, res_stl]:
+    for result in [res_z, res_cusum]:
         if len(result.anomalies) > 0 or len(result.intervals) > 0 or result.visual_type != "none":
             valid_results.append(result)
     
     if not valid_results:
         logger.warning("所有检测方法都未找到异常或失败")
         return {
-            "method_results": [res_z, res_cusum, res_stl],
+            "method_results": [res_z, res_cusum],
             "composite_score": 0,
             "classification": "正常",
             "anomaly_times": []
         }
     
-    # 避免STL和Z-Score重复计算
+    # 避免重复计算
     method_results = []
     method_names = set()
     
-    for result in [res_z, res_cusum, res_stl]:
+    for result in [res_z, res_cusum]:
         # 跳过重复方法
-        if result.method == "STL-Fallback" and "Z-Score" in method_names:
-            logger.info("跳过与Z-Score重复的STL回退结果")
+        if result.method in method_names:
+            logger.info(f"跳过重复的 {result.method} 结果")
             continue
         method_results.append(result)
         method_names.add(result.method)

@@ -11,6 +11,7 @@ import config
 import dateparser
 from django.conf import settings
 
+
 from analysis.single_series import analyze_single_series
 from analysis.multi_series import analyze_multi_series
 from output.report_generator import generate_report_single, generate_report_multi
@@ -24,6 +25,18 @@ CACHE_DIR = "cached_data"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 def _cache_filename(ip:str, start_ts:int, end_ts:int, field:str)->str:
+    """
+    生成缓存文件名（注意此函数的参数顺序必须保持不变）
+    
+    参数:
+        ip: 主机IP
+        start_ts: 开始时间戳
+        end_ts: 结束时间戳
+        field: 指标字段
+        
+    返回:
+        str: 缓存文件路径
+    """
     key = f"{ip}_{field}_{start_ts}_{end_ts}"  # 注意字段顺序
     h = hashlib.md5(key.encode('utf-8')).hexdigest()
     return os.path.join(CACHE_DIR, f"{h}.json")
@@ -275,55 +288,6 @@ tools = [
             },
             "required": ["ip1","field1","start1","end1","ip2","field2","start2","end2"]
         }
-    },
-     {
-        "name": "生成异常检测图表和报告(TaskPlan版)",
-        "description": "根据用户意图生成的 TaskPlan（分析计划），执行对应的异常检测任务，并生成图表和 HTML 报告。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "task_plan": {
-                    "type": "object",
-                    "description": "任务计划结构体，包含用户查询、任务类型、时间段、IP、字段等信息。",
-                    "properties": {
-                        "user_query": {"type": "string"},
-                        "output_dir": {"type": "string"},
-                        "tasks": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "task_id": {"type": "string"},
-                                    "task_type": {"type": "string", "enum": ["single", "pair", "multivariate"]},
-                                    "field": {"type": "string"},
-                                    "series": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "label": {"type": "string"},
-                                                "ip": {"type": "string"},
-                                                "field": {"type": "string"},
-                                                "start": {"type": "string"},
-                                                "end": {"type": "string"}
-                                            },
-                                            "required": ["ip", "start", "end"]
-                                        }
-                                    },
-                                    "enabled_methods": {
-                                        "type": "array",
-                                        "items": {"type": "string"}
-                                    }
-                                },
-                                "required": ["task_id", "task_type", "field", "series"]
-                            }
-                        }
-                    },
-                    "required": ["user_query", "tasks"]
-                }
-            },
-            "required": ["task_plan"]
-        }
     }
 ]
 
@@ -367,7 +331,6 @@ def get_service_asset_edges(service, instance_ip):
     else:
         return f"查询拓扑失败: {resp.status_code} => {resp.text}"
     
-
 def get_monitor_metric_value(ip, start, end, field):
     import datetime
     def to_int(s):
@@ -512,15 +475,19 @@ def react(llm_text):
         except:
             return f"无法解析调用参数JSON: {inp_str}", False
 
-        # 检查IP是否为待定或空
-        if action in ["单序列异常检测(文件)", "多序列对比异常检测(文件)"]:
-            if action_input.get("ip", "") in ["待定", ""]:
-                return "请提供要分析的具体IP地址", False
-            
-            # 对于多序列分析，同时检查第二个IP
-            if action == "多序列对比异常检测(文件)" and action_input.get("ip2", "") in ["待定", ""]:
-                return "请提供第二个要分析的具体IP地址", False
-
+        # 其他 action 保持不变
+        if action == "解析用户自然语言时间":
+            return parse_time_expressions(action_input["raw_text"]), False
+        if action == "请求智能运管后端Api，获取指标项的时序数据":
+            return get_monitor_metric_value(**action_input), False
+        if action == "请求智能运管后端Api，查询监控实例有哪些监控项":
+            return monitor_item_list(action_input["instance"]), False
+        elif action == "请求智能运管后端Api，查询监控服务的资产情况和监控实例":
+            return get_service_asset(action_input["service"]), False
+        elif action == "请求智能运管后端Api，查询监控实例之间的拓扑关联关系":
+            return get_service_asset_edges(action_input["service"], action_input["instance_ip"]), False
+        
+        
         if action == "单序列异常检测(文件)":
             result = single_series_detect(**action_input)
             if "error" in result:
@@ -544,6 +511,25 @@ def react(llm_text):
             return final_answer, False
 
         elif action == "多序列对比异常检测(文件)":
+            
+            sequence_nums = set()
+            for key in action_input.keys():
+                if key.startswith(('ip', 'field', 'start', 'end')) and len(key) > 2 and key[2:].isdigit():
+                    sequence_nums.add(int(key[2:]))
+            
+            if len(sequence_nums) > 2 or max(sequence_nums, default=0) > 2:
+                return "多序列对比异常检测工具目前一次只能对比两个序列。请先指定要对比的两个序列，之后可以进行其他序列的对比。", False
+            
+            required_pairs = [
+                ('ip1', 'field1', 'start1', 'end1'),
+                ('ip2', 'field2', 'start2', 'end2')
+            ]
+            
+            for pair in required_pairs:
+                if not all(param in action_input for param in pair):
+                    missing = [param for param in pair if param not in action_input]
+                    return f"缺少必要参数: {', '.join(missing)}", False
+
             result = multi_series_detect(**action_input)
             if "error" in result:
                 return result["error"], False
@@ -564,18 +550,6 @@ def react(llm_text):
 **图表路径**：{rep['report_path']}
 """
             return final_answer, False
-
-        # 其他 action 保持不变
-        elif action == "解析用户自然语言时间":
-            return parse_time_expressions(action_input["raw_text"]), False
-        elif action == "请求智能运管后端Api，获取指标项的时序数据":
-            return get_monitor_metric_value(**action_input), False
-        elif action == "请求智能运管后端Api，查询监控实例有哪些监控项":
-            return monitor_item_list(action_input["instance"]), False
-        elif action == "请求智能运管后端Api，查询监控服务的资产情况和监控实例":
-            return get_service_asset(action_input["service"]), False
-        elif action == "请求智能运管后端Api，查询监控实例之间的拓扑关联关系":
-            return get_service_asset_edges(action_input["service"], action_input["instance_ip"]), False
         else:
             return f"未知工具调用: {action}", False
         
@@ -641,7 +615,7 @@ def chat(user_query):
     当前时间为: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
     处理规则：
-    1.请根据当前时间来推断用户输入的时间区间的具体值。当你解析时间表达式后，请使用start_str和end_str字段中的具体时间值作为后续调用的时间参数，避免使用"解析结果中的start时间"这样的占位符。
+    1.请根据当前时间来推断用户输入的具体日期。当你解析时间表达式后，请使用start_str和end_str字段中的具体时间值作为后续调用的时间参数，避免使用"解析结果中的start时间"这样的占位符。
     2.如 parse_time_expressions 只返回1个时间区间，则调用'单序列异常检测(文件)'。
     3.如 parse_time_expressions 返回2个时间区间，并且用户输入包含"对比"、"相比"、"比较"、"环比"、"VS"、"vs"、"变化"、"相较于"等明显比较词汇，则调用'多序列对比异常检测(文件)'。
     4.若parse_time_expressions 返回超过1个时间区间，但是没有明显的比较词汇，可先在<补充请求>里提问，示例:
@@ -665,6 +639,7 @@ def chat(user_query):
     round_num=1
     max_round=15
     pending_context = None 
+    had_supplement = False
 
     while True:
         print(f"=== 第{round_num}轮对话 ===")
@@ -689,8 +664,11 @@ def chat(user_query):
         if isinstance(res, dict) and res.get("type") == "supplement":
             print(f"\n小助手: {res['content']}")
             user_input = input("你: ")
-            history.append({"role": "user", "content": user_input})
-            pending_context = {"history": history.copy()}
+            
+            supplement_response = f"对于您的问题 '{res['content']}'，我的回答是: {user_input}"
+            history.append({"role": "user", "content": supplement_response})
+            
+            had_supplement = True
             round_num += 1
             continue
 
@@ -717,4 +695,4 @@ def chat(user_query):
 if __name__ == '__main__':
     # chat('你好')
     chat(
-        '请分析192.168.0.110这台主机这周星期一和上周星期一还有昨天的cpu利用率，并作图给出分析报告')
+        '请分析192.168.0.110这台主机上周星期一和上上周星期一的cpu利用率还有昨天的用户cpu利用率，并作图给出分析报告')

@@ -12,12 +12,8 @@ logger = logging.getLogger("anomaly_detection")
 
 # 各个检测方法的权重配置 - 调整权重使得结果更合理
 WEIGHTS_SINGLE = {
-    "Z-Score": 0.25,
-    "CUSUM": 0.25,
-    "STL": 0.5,
-    # 备选方法
-    "STL-Simplified": 0.4,
-    "STL-Fallback": 0.2
+    "Z-Score": 0.5,
+    "CUSUM": 0.5
 }
 
 WEIGHTS_MULTI = {
@@ -39,16 +35,6 @@ DEFAULT_THRESHOLD_CONFIG = {
     "CUSUM": {
         "drift_threshold": 6.0,  # 增大偏移阈值
         "k": 0.7  # 增大k值，减少对小波动的敏感度
-    },
-    "STL": {
-        "seasonal": 24,  # 更合理的季节周期（24小时）
-        "z_threshold": 3.5  # 增大阈值
-    },
-    "STL-Simplified": {
-        "z_threshold": 3.5
-    },
-    "STL-Fallback": {
-        "threshold": 3.5
     },
     "ResidualComparison": {
         "threshold": 3.5

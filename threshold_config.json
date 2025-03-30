@@ -8,11 +8,6 @@
     "k": 0.5,
     "description": "CUSUM累积和阈值及灵敏度参数k，k越小对小漂移越敏感"
   },
-  "STL": {
-    "z_threshold": 3.0,
-    "seasonal": 13,
-    "description": "STL分解后残差Z-Score阈值，以及季节性周期长度"
-  },
   "ResidualComparison": {
     "threshold": 3.0,
     "description": "两序列残差Z-Score阈值，超过此值视为异常"
