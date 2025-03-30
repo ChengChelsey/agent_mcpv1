@@ -1,0 +1,3902 @@
+# === main.py ===
+# main.py
+import sys
+import agent
+
+def main():
+    if len(sys.argv) > 1:
+        query = " ".join(sys.argv[1:])
+    else:
+        query = input("请输入查询: ")
+    agent.chat(query)
+
+if __name__ == '__main__':
+    main()
+
+
+# === agent.py ===
+#! /usr/bin/env python3
+import re
+import json
+import datetime
+import requests
+import time
+import os  
+import traceback
+import hashlib
+import config 
+import dateparser
+from django.conf import settings
+
+from analysis.single_series import analyze_single_series
+from analysis.multi_series import analyze_multi_series
+from output.report_generator import generate_report_single, generate_report_multi
+from output.visualization import generate_summary_echarts_html, generate_echarts_html_single, generate_echarts_html_multi
+
+AIOPS_BACKEND_DOMAIN = 'https://aiopsbackend.cstcloud.cn'
+LLM_URL = 'http://10.16.1.16:58000/v1/chat/completions'
+AUTH = ('chelseyyycheng@outlook.com', 'UofV1uwHwhVp9tcTue')
+
+CACHE_DIR = "cached_data"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+def _cache_filename(ip:str, start_ts:int, end_ts:int, field:str)->str:
+    key = f"{ip}_{field}_{start_ts}_{end_ts}"  # 注意字段顺序
+    h = hashlib.md5(key.encode('utf-8')).hexdigest()
+    return os.path.join(CACHE_DIR, f"{h}.json")
+
+def fetch_data_from_backend(ip:str, start_ts:int, end_ts:int, field:str):
+    url = f"{AIOPS_BACKEND_DOMAIN}/api/v1/monitor/mail/metric/format-value/?start={start_ts}&end={end_ts}&instance={ip}&field={field}"
+    resp = requests.get(url, auth=AUTH)
+    if resp.status_code!=200:
+        return f"后端请求失败: {resp.status_code} => {resp.text}"
+    j = resp.json()
+    results = j.get("results", [])
+    if not results:
+        return []
+    vals = results[0].get("values", [])
+    arr = []
+    from datetime import datetime
+    def parse_ts(s):
+        try:
+            dt = datetime.strptime(s,"%Y-%m-%d %H:%M:%S")
+            return int(dt.timestamp())
+        except:
+            return 0
+    for row in vals:
+        if len(row)>=2:
+            tstr,vstr = row[0], row[1]
+            t = parse_ts(tstr)
+            try:
+                v = float(vstr)
+            except:
+                v = 0.0
+            arr.append([t,v])
+    return arr
+
+def ensure_cache_file(ip:str, start:str, end:str, field:str)->str:
+    """
+    确保缓存文件存在，如果不存在则从后端获取
+    
+    参数:
+        ip: 主机IP
+        start: 开始时间 (格式: "YYYY-MM-DD HH:MM:SS")
+        end: 结束时间 (格式: "YYYY-MM-DD HH:MM:SS")
+        field: 指标字段
+        
+    返回:
+        str: 缓存文件路径或错误信息
+    """
+    import datetime
+    def to_int(s):
+        try:
+            dt = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+            return int(dt.timestamp())
+        except ValueError as e:
+            # 处理日期无效的情况
+            if "day is out of range for month" in str(e):
+                # 找出有效的日期
+                parts = s.split(" ")[0].split("-")
+                year, month = int(parts[0]), int(parts[1])
+                
+                # 获取该月的最后一天
+                if month == 2:
+                    # 检查是否是闰年
+                    is_leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+                    last_day = 29 if is_leap else 28
+                elif month in [4, 6, 9, 11]:
+                    last_day = 30
+                else:
+                    last_day = 31
+                
+                # 构造有效日期字符串
+                valid_date = f"{year}-{month:02d}-{last_day:02d} {s.split(' ')[1]}"
+                print(f"日期已自动调整: {s} -> {valid_date}")
+                
+                dt = datetime.datetime.strptime(valid_date, "%Y-%m-%d %H:%M:%S")
+                return int(dt.timestamp())
+            else:
+                # 其他错误直接抛出
+                raise
+    
+    try:
+        st_i = to_int(start)
+        et_i = to_int(end)
+        fpath = _cache_filename(ip, st_i, et_i, field)
+
+        if os.path.exists(fpath):
+            print("(已从本地缓存读取)")
+            return fpath
+        else:
+            data = fetch_data_from_backend(ip, st_i, et_i, field)
+            if isinstance(data, str):
+                return data
+            with open(fpath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print("(已调用后端并写入本地缓存)")
+            return fpath
+    except Exception as e:
+        return f"缓存文件创建失败: {str(e)}"
+
+def load_series_from_cachefile(filepath:str):
+    if not os.path.exists(filepath):
+        return None
+    with open(filepath,"r",encoding="utf-8") as f:
+        arr = json.load(f)
+    return arr
+
+def parse_time_expressions(raw_text:str):
+    segments = re.split(r'[,\uFF0C\u3001\u0026\u002C\u002F\u0020\u0026\u2014\u2013\u2014\u006E\u005E]|和|与|及|还有|、', raw_text)
+    results = []
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+
+        dt = dateparser.parse(seg, languages=['zh','en'], settings={"PREFER_DATES_FROM":"past"})
+        if dt is None:
+            results.append({"start":0, "end":0, "error":f"无法解析: {seg}"})
+        else:
+            day_s = datetime.datetime(dt.year, dt.month, dt.day, 0,0,0)
+            day_e = datetime.datetime(dt.year, dt.month, dt.day, 23,59,59)
+            
+            # 添加格式化的时间字符串
+            start_str = day_s.strftime("%Y-%m-%d %H:%M:%S")
+            end_str = day_e.strftime("%Y-%m-%d %H:%M:%S")
+            
+            results.append({
+                "start": int(day_s.timestamp()),
+                "end": int(day_e.timestamp()),
+                "error": "",
+                "start_str": start_str,
+                "end_str": end_str
+            })
+    return results
+
+tools = [
+     {
+        "name":"解析用户自然语言时间",
+        "description":"返回一个list，每个元素是{start, end, error}. 如果不确定，可向用户澄清。",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "raw_text":{"type":"string"}
+            },
+            "required":["raw_text"]
+        }
+    },
+    {  
+        "name": "请求智能运管后端Api，获取指标项的时序数据",
+        "description": "从后端或本地缓存获取IP在指定时间范围(field)的时序数据(list of [int_ts, val])。注意start/end必须是形如'YYYY-MM-DD HH:MM:SS'的确定时间。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ip": {
+                    "type": "string",
+                    "description": "要查询的 IP，如 '192.168.0.110'"
+                },
+                "start": {
+                    "type": "string",
+                    "description": "开始时间，格式 '2025-03-24 00:00:00'"
+                },
+                "end": {
+                    "type": "string",
+                    "description": "结束时间，格式 '2025-03-24 23:59:59'"
+                },
+                "field": {
+                    "type": "string",
+                    "description": "监控项名称，如 'cpu_rate'"
+                }
+            },
+            "required": ["ip","start","end","field"]
+        }
+    },
+    {
+        "name": "请求智能运管后端Api，查询监控实例有哪些监控项",
+        "description": "返回指定IP下可用的监控项列表（可选项）",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "description": "系统服务名称 (一般填 '主机监控')"
+                },
+                "instance": {
+                    "type": "string",
+                    "description": "监控实例 IP"
+                }
+            },
+            "required": ["service","instance"]
+        }
+    },
+    {
+        "name": "请求智能运管后端Api，查询监控服务的资产情况和监控实例",
+        "description": "查询一个监控服务的所有资产/IP等信息",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "description": "要查询的系统服务名称"
+                }
+            },
+            "required": ["service"]
+        }
+    },
+    {
+        "name": "请求智能运管后端Api，查询监控实例之间的拓扑关联关系",
+        "description": "查询指定IP的上联、下联监控实例等信息",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "description": "系统服务名称"
+                },
+                "instance_ip": {
+                    "type": "string",
+                    "description": "监控实例IP"
+                }
+            },
+            "required": ["service","instance_ip"]
+        }
+    },
+    {
+        "name": "单序列异常检测(文件)",
+        "description": "对单序列 [int_ts,val] 进行多方法分析, 生成报告和ECharts HTML",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ip":    {"type": "string"},
+                "field": {"type": "string"},
+                "start": {"type": "string"},
+                "end":   {"type": "string"}
+            },
+            "required": ["ip","field","start","end"]
+        }
+    },
+    {
+        "name": "多序列对比异常检测(文件)",
+        "description": "对两组 [int_ts,val] 进行对比分析, 生成报告和ECharts HTML",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ip1":    {"type": "string"},
+                "field1": {"type": "string"},
+                "start1": {"type": "string"},
+                "end1":   {"type": "string"},
+                "ip2":    {"type": "string"},
+                "field2": {"type": "string"},
+                "start2": {"type": "string"},
+                "end2":   {"type": "string"}
+            },
+            "required": ["ip1","field1","start1","end1","ip2","field2","start2","end2"]
+        }
+    },
+     {
+        "name": "生成异常检测图表和报告(TaskPlan版)",
+        "description": "根据用户意图生成的 TaskPlan（分析计划），执行对应的异常检测任务，并生成图表和 HTML 报告。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_plan": {
+                    "type": "object",
+                    "description": "任务计划结构体，包含用户查询、任务类型、时间段、IP、字段等信息。",
+                    "properties": {
+                        "user_query": {"type": "string"},
+                        "output_dir": {"type": "string"},
+                        "tasks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "task_id": {"type": "string"},
+                                    "task_type": {"type": "string", "enum": ["single", "pair", "multivariate"]},
+                                    "field": {"type": "string"},
+                                    "series": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "label": {"type": "string"},
+                                                "ip": {"type": "string"},
+                                                "field": {"type": "string"},
+                                                "start": {"type": "string"},
+                                                "end": {"type": "string"}
+                                            },
+                                            "required": ["ip", "start", "end"]
+                                        }
+                                    },
+                                    "enabled_methods": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    }
+                                },
+                                "required": ["task_id", "task_type", "field", "series"]
+                            }
+                        }
+                    },
+                    "required": ["user_query", "tasks"]
+                }
+            },
+            "required": ["task_plan"]
+        }
+    }
+]
+
+def monitor_item_list(ip):
+    url = f'{AIOPS_BACKEND_DOMAIN}/api/v1/monitor/mail/machine/field/?instance={ip}'
+    resp = requests.get(url=url, auth=AUTH)
+    if resp.status_code == 200:
+        items = json.loads(resp.text)
+        result = {}
+        for x in items:
+            result[x.get('field')] = x.get('purpose')
+        return result
+    else:
+        return f"查询监控项失败: {resp.status_code} => {resp.text}"
+
+def get_service_asset(service):
+    url = f'{AIOPS_BACKEND_DOMAIN}/api/v1/property/mail/?ordering=num_id&page=1&page_size=2000'
+    resp = requests.get(url=url, auth=AUTH)
+    if resp.status_code == 200:
+        text = json.loads(resp.text)
+        results = text.get('results',[])
+        item_list = []
+        for r in results:
+            r["category"] = r.get("category",{}).get("name")
+            r["ip_set"] = [_.get("ip") for _ in r.get('ip_set',[])]
+            for k in ["num_id","creation","modification","remark","sort_weight","monitor_status"]:
+                r.pop(k, None)
+            for k,v in list(r.items()):
+                if not v or v == "无":
+                    r.pop(k)
+            item_list.append(r)
+        return item_list
+    else:
+        return f"查询失败: {resp.status_code} => {resp.text}"
+
+def get_service_asset_edges(service, instance_ip):
+    url = f'{AIOPS_BACKEND_DOMAIN}/api/v1/property/mail/topology/search?instance={instance_ip}'
+    resp = requests.get(url=url, auth=AUTH)
+    if resp.status_code == 200:
+        return json.loads(resp.text)
+    else:
+        return f"查询拓扑失败: {resp.status_code} => {resp.text}"
+    
+
+def get_monitor_metric_value(ip, start, end, field):
+    import datetime
+    def to_int(s):
+        dt = datetime.datetime.strptime(s,"%Y-%m-%d %H:%M:%S")
+        return int(dt.timestamp())
+    st_i = to_int(start)
+    et_i = to_int(end)
+    fpath= _cache_filename(ip, st_i, et_i, field)
+    if os.path.exists(fpath):
+        print("(已从本地缓存读取)")
+        return json.load(open(fpath,"r",encoding="utf-8"))
+    else:
+        data= fetch_data_from_backend(ip, st_i, et_i, field)
+        if isinstance(data,str):
+            return data
+        with open(fpath,"w",encoding="utf-8") as f:
+            json.dump(data,f,ensure_ascii=False,indent=2)
+        print("(已调用后端并写入本地缓存)")
+        return data
+
+###############################################################################
+def single_series_detect(ip, field, start, end):
+    fpath = ensure_cache_file(ip, start, end, field)
+    if isinstance(fpath, str) and not os.path.exists(fpath):
+        return {"error": fpath}  
+
+    if os.path.exists(fpath):
+        series = load_series_from_cachefile(fpath)
+        if series is None:
+            return {"error": f"无法加载缓存文件: {fpath}"}
+
+        try:
+            user_query = f"分析 {ip} 在 {start} ~ {end} 的 {field} 数据"
+            result = generate_report_single(series, ip, field, user_query)
+            return result
+        except Exception as e:
+            print(f"单序列分析生成报告失败: {e}")
+            traceback.print_exc()  # 打印详细错误
+            # 通过旧方法返回基本结果
+            analysis_result = analyze_single_series(series)
+            return {
+                "classification": analysis_result["classification"],
+                "composite_score": analysis_result["composite_score"],
+                "anomaly_times": analysis_result["anomaly_times"],
+                "report_path": "N/A - 报告生成失败"
+            }
+
+    return {"error": fpath}
+
+def multi_series_detect(ip1, field1, start1, end1, ip2, field2, start2, end2):
+    fpath1 = ensure_cache_file(ip1, start1, end1, field1)
+    fpath2 = ensure_cache_file(ip2, start2, end2, field2)
+    
+    if isinstance(fpath1, str) and not os.path.exists(fpath1):
+        return {"error": fpath1}
+    if isinstance(fpath2, str) and not os.path.exists(fpath2):
+        return {"error": fpath2}
+
+    series1 = load_series_from_cachefile(fpath1)
+    series2 = load_series_from_cachefile(fpath2)
+    if series1 is None or series2 is None:
+        return {"error": f"无法加载本地缓存文件: {fpath1} / {fpath2}"}
+
+    try:
+        user_query = f"对比分析 {ip1} 在 {start1} 和 {start2} 的 {field1} 指标"
+        result = generate_report_multi(series1, series2, ip1, ip2, field1, user_query)
+        return result
+    except Exception as e:
+        print(f"多序列分析生成报告失败: {e}")
+        traceback.print_exc()  # 打印详细错误
+        # 通过旧方法返回基本结果
+        analysis_result = analyze_multi_series(series1, series2)
+        return {
+            "classification": analysis_result["classification"],
+            "composite_score": analysis_result["composite_score"],
+            "anomaly_times": analysis_result["anomaly_times"],
+            "anomaly_intervals": analysis_result.get("anomaly_intervals", []),
+            "report_path": "N/A - 报告生成失败"
+        }
+
+###############################################################################
+
+def llm_call(messages):
+    data={
+      "model":"Qwen2.5-14B-Instruct",
+      "temperature":0.1,
+      "messages":messages
+    }
+    r= requests.post(LLM_URL, json=data)
+    if r.status_code==200:
+        jj= r.json()
+        if "choices" in jj and len(jj["choices"])>0:
+            return jj["choices"][0]["message"]
+        else:
+            return None
+    else:
+        print("Error:", r.status_code, r.text)
+        return None
+    
+def init_msg(role, content):
+    return {"role": role, "content": content}
+
+
+def parse_llm_response(txt):
+    pat_thought = r"<思考过程>(.*?)</思考过程>"
+    pat_action  = r"<工具调用>(.*?)</工具调用>"
+    pat_inparam = r"<调用参数>(.*?)</调用参数>"
+    pat_final   = r"<最终答案>(.*?)</最终答案>"
+    pat_supplement = r"<补充请求>(.*?)</补充请求>"
+    def ext(pattern):
+        m = re.search(pattern, txt, flags=re.S)
+        return m.group(1) if m else ""
+
+    return {
+        "thought": ext(pat_thought),
+        "action":  ext(pat_action),
+        "action_input": ext(pat_inparam),
+        "final_answer": ext(pat_final),
+        "supplement": ext(pat_supplement)
+    }
+
+def react(llm_text):
+    parsed = parse_llm_response(llm_text)
+    action = parsed["action"]
+    inp_str = parsed["action_input"]
+    final_ans = parsed["final_answer"]
+    supplement = parsed["supplement"]
+    is_final = False
+
+    if action and inp_str:
+        try:
+            action_input = json.loads(inp_str)
+        
+        # 检查是否存在时间占位符
+            for key in ["start", "end"]:
+                if key in action_input and isinstance(action_input[key], str):
+                    value = action_input[key]
+                # 检测占位符文本
+                    if "解析结果" in value or "待定" in value:
+                    # 提示用户指定时间
+                        return f"请提供具体的{key}时间（格式：YYYY-MM-DD HH:MM:SS）", False
+        except:
+            return f"无法解析调用参数JSON: {inp_str}", False
+
+        # 检查IP是否为待定或空
+        if action in ["单序列异常检测(文件)", "多序列对比异常检测(文件)"]:
+            if action_input.get("ip", "") in ["待定", ""]:
+                return "请提供要分析的具体IP地址", False
+            
+            # 对于多序列分析，同时检查第二个IP
+            if action == "多序列对比异常检测(文件)" and action_input.get("ip2", "") in ["待定", ""]:
+                return "请提供第二个要分析的具体IP地址", False
+
+        if action == "单序列异常检测(文件)":
+            result = single_series_detect(**action_input)
+            if "error" in result:
+                return result["error"], False
+
+            rep = result
+            # 添加文字分析报告
+            analysis_text = rep.get("analysis_text", "")
+    
+            final_answer = f"""
+## 单序列异常检测报告
+
+**结论**：{rep['classification']}  
+**得分**：{rep['composite_score']:.2f}  
+**异常点数**：{len(rep['anomaly_times'])}
+
+{analysis_text}
+
+**图表路径**：{rep['report_path']}
+"""
+            return final_answer, False
+
+        elif action == "多序列对比异常检测(文件)":
+            result = multi_series_detect(**action_input)
+            if "error" in result:
+                return result["error"], False
+
+            rep = result
+            # 添加文字分析报告到返回结果
+            analysis_text = rep.get("analysis_text", "")
+    
+            final_answer = f"""
+## 多序列对比异常检测报告
+
+**结论**：{rep['classification']}  
+**综合得分**：{rep['composite_score']:.2f}  
+**异常段数**：{len(rep.get('anomaly_intervals', []))}
+
+{analysis_text}
+
+**图表路径**：{rep['report_path']}
+"""
+            return final_answer, False
+
+        # 其他 action 保持不变
+        elif action == "解析用户自然语言时间":
+            return parse_time_expressions(action_input["raw_text"]), False
+        elif action == "请求智能运管后端Api，获取指标项的时序数据":
+            return get_monitor_metric_value(**action_input), False
+        elif action == "请求智能运管后端Api，查询监控实例有哪些监控项":
+            return monitor_item_list(action_input["instance"]), False
+        elif action == "请求智能运管后端Api，查询监控服务的资产情况和监控实例":
+            return get_service_asset(action_input["service"]), False
+        elif action == "请求智能运管后端Api，查询监控实例之间的拓扑关联关系":
+            return get_service_asset_edges(action_input["service"], action_input["instance_ip"]), False
+        else:
+            return f"未知工具调用: {action}", False
+        
+    if supplement.strip():
+        return {"type": "supplement", "content": supplement}
+
+    if final_ans.strip():
+        is_final = True
+        return final_ans, is_final
+
+    return ("格式不符合要求，必须使用：<思考过程></思考过程> <工具调用></工具调用> <调用参数></调用参数> <最终答案></最终答案>", is_final)
+
+def shorten_tool_result(res):
+    if isinstance(res, list):
+        # 特殊处理时间解析结果
+        if len(res) > 0 and isinstance(res[0], dict) and "start" in res[0] and "end" in res[0]:
+            # 添加格式化的时间字符串
+            for item in res:
+                if "error" not in item or not item["error"]:
+                    # 如果不存在start_str和end_str，添加它们
+                    if "start_str" not in item:
+                        start_dt = datetime.datetime.fromtimestamp(item["start"])
+                        item["start_str"] = start_dt.strftime("%Y-%m-%d %H:%M:%S") 
+                    if "end_str" not in item:
+                        end_dt = datetime.datetime.fromtimestamp(item["end"])
+                        item["end_str"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # 生成一个更易读的摘要
+            time_results = []
+            for item in res:
+                if "error" in item and item["error"]:
+                    time_results.append({"error": item["error"]})
+                else:
+                    time_results.append({
+                        "start_time": item.get("start_str", ""),
+                        "end_time": item.get("end_str", ""),
+                        "start": item.get("start", 0),
+                        "end": item.get("end", 0)
+                    })
+            return json.dumps(time_results, ensure_ascii=False)
+        return f"[List len={len(res)}]"
+    # 其他类型的响应保持不变
+    elif isinstance(res, dict):
+        summary = {}
+        for k,v in res.items():
+            if isinstance(v, list):
+                summary[k] = f"[List len={len(v)}]"
+            elif isinstance(v, str) and len(v)>300:
+                summary[k] = v[:300] + f"...(omitted, length={len(v)})"
+            else:
+                summary[k] = v
+        return json.dumps(summary, ensure_ascii=False)
+    elif isinstance(res, str) and len(res)>300:
+        return res[:300] + f"...(omitted, length={len(res)})"
+    else:
+        return str(res)
+
+def chat(user_query):
+    system_prompt = f'''你是一个严格遵守格式规范的用于运维功能，运维数据可视化，运行于生产环境的ReAct智能体，你叫小助手，必须按以下格式处理请求：
+
+    你的工具列表如下:
+    {json.dumps(tools, ensure_ascii=False, indent=2)}
+    当前时间为: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+    处理规则：
+    1.请根据当前时间来推断用户输入的时间区间的具体值。当你解析时间表达式后，请使用start_str和end_str字段中的具体时间值作为后续调用的时间参数，避免使用"解析结果中的start时间"这样的占位符。
+    2.如 parse_time_expressions 只返回1个时间区间，则调用'单序列异常检测(文件)'。
+    3.如 parse_time_expressions 返回2个时间区间，并且用户输入包含"对比"、"相比"、"比较"、"环比"、"VS"、"vs"、"变化"、"相较于"等明显比较词汇，则调用'多序列对比异常检测(文件)'。
+    4.若parse_time_expressions 返回超过1个时间区间，但是没有明显的比较词汇，可先在<补充请求>里提问，示例:
+    <思考过程>我不知道用户是要对这些时间的数据分别进行单序列分析还是一起多序列分析，我需要确认</思考过程> <工具调用></工具调用> <调用参数></调用参数> <最终答案></最终答案> <补充请求>请问您是想对每段数据进行单序列分析，还是需要多序列的对比分析</补充请求> 
+    5.根据用户的输入来判断是否要调用工具以及调用哪个工具,判断不确定的时候可以使用<补充请求>来询问用户
+    6.你每次只能调用一个工具，不能在同一次响应中调用多个工具，如果有多个任务，请分轮执行。尽量减少不必要的补充请求。
+    7.不能伪造数据
+    8.严格按照以下xml格式生成响应文本：
+    ```
+    <思考过程>你的思考过程</思考过程>
+    <工具调用>工具名称，不调用则为空</工具调用>
+    <调用参数>工具输入参数{{json}}</调用参数>
+    <最终答案>用户问题的最终结果（知道问题的最终答案时返回）</最终答案>
+    <补充请求>系统请求用户补充信息</补充请求>
+    ```
+    '''
+    history=[]
+    history.append({"role":"system","content":system_prompt})
+    history.append({"role":"user","content": user_query})
+
+    round_num=1
+    max_round=15
+    pending_context = None 
+
+    while True:
+        print(f"=== 第{round_num}轮对话 ===")
+
+        if pending_context:
+            ans = llm_call(pending_context["history"])
+            pending_context = None  
+        else:
+            ans = llm_call(history)
+            
+        if not ans:
+            print("大模型返回None,结束")
+            return
+
+        #print("## 大模型完整响应:", ans)
+        print(ans["content"])
+
+        history.append(ans)
+        txt= ans.get("content","")
+        res = react(txt)
+
+        if isinstance(res, dict) and res.get("type") == "supplement":
+            print(f"\n小助手: {res['content']}")
+            user_input = input("你: ")
+            history.append({"role": "user", "content": user_input})
+            pending_context = {"history": history.copy()}
+            round_num += 1
+            continue
+
+        result, done = res
+        
+        short_result = shorten_tool_result(result)
+        history.append({
+            "role":"user",
+            "content": f"<工具调用结果>: {short_result}"
+        })
+
+        if done:
+            print("===最终输出===")
+            print(result)
+            return
+
+        round_num+=1
+        if round_num>max_round:
+            print("超出上限")
+            return
+
+
+
+if __name__ == '__main__':
+    # chat('你好')
+    chat(
+        '请分析192.168.0.110这台主机这周星期一和上周星期一还有昨天的cpu利用率，并作图给出分析报告')
+
+
+# === config.py ===
+# config.py
+import json
+import os
+import logging
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("anomaly_detection")
+
+# 各个检测方法的权重配置 - 调整权重使得结果更合理
+WEIGHTS_SINGLE = {
+    "Z-Score": 0.25,
+    "CUSUM": 0.25,
+    "STL": 0.5,
+    # 备选方法
+    "STL-Simplified": 0.4,
+    "STL-Fallback": 0.2
+}
+
+WEIGHTS_MULTI = {
+    "ResidualComparison": 0.4,  # 提高残差对比的权重
+    "TrendDriftCUSUM": 0.25,    # 降低CUSUM的权重
+    "ChangeRate": 0.15,
+    "TrendSlope": 0.2
+}
+
+# 综合分数阈值 - 提高阈值，减少误报
+HIGH_ANOMALY_THRESHOLD = 0.7
+MILD_ANOMALY_THRESHOLD = 0.4
+
+# 默认的各检测方法阈值配置 - 更加严格的阈值
+DEFAULT_THRESHOLD_CONFIG = {
+    "Z-Score": {
+        "threshold": 3.5  # 增大Z-Score阈值，减少误检
+    },
+    "CUSUM": {
+        "drift_threshold": 6.0,  # 增大偏移阈值
+        "k": 0.7  # 增大k值，减少对小波动的敏感度
+    },
+    "STL": {
+        "seasonal": 24,  # 更合理的季节周期（24小时）
+        "z_threshold": 3.5  # 增大阈值
+    },
+    "STL-Simplified": {
+        "z_threshold": 3.5
+    },
+    "STL-Fallback": {
+        "threshold": 3.5
+    },
+    "ResidualComparison": {
+        "threshold": 3.5
+    },
+    "TrendDriftCUSUM": {
+        "drift_threshold": 8.0  # 显著增大阈值减少误报
+    },
+    "ChangeRate": {
+        "threshold": 0.7  # 增大变化率阈值
+    },
+    "TrendSlope": {
+        "slope_threshold": 0.4,  # 增大斜率阈值
+        "window": 5
+    }
+}
+
+# 创建配置目录
+CONFIG_DIR = "config"
+os.makedirs(CONFIG_DIR, exist_ok=True)
+THRESHOLD_CONFIG_PATH = os.path.join(CONFIG_DIR, "threshold_config.json")
+
+# 如果不存在配置文件，创建一个默认配置
+if not os.path.exists(THRESHOLD_CONFIG_PATH):
+    try:
+        with open(THRESHOLD_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_THRESHOLD_CONFIG, f, ensure_ascii=False, indent=2)
+        logger.info(f"已创建默认阈值配置文件: {THRESHOLD_CONFIG_PATH}")
+    except Exception as e:
+        logger.warning(f"无法创建默认配置文件: {e}")
+
+# 加载用户定义的阈值配置
+try:
+    with open(THRESHOLD_CONFIG_PATH, "r", encoding="utf-8") as f:
+        USER_THRESHOLD_CONFIG = json.load(f)
+        # 合并用户配置与默认配置
+        THRESHOLD_CONFIG = DEFAULT_THRESHOLD_CONFIG.copy()
+        for method, config in USER_THRESHOLD_CONFIG.items():
+            if method in THRESHOLD_CONFIG:
+                THRESHOLD_CONFIG[method].update(config)
+            else:
+                THRESHOLD_CONFIG[method] = config
+        logger.info(f"已加载用户阈值配置: {THRESHOLD_CONFIG_PATH}")
+except Exception as e:
+    logger.warning(f"无法读取阈值配置文件，使用默认值: {e}")
+    THRESHOLD_CONFIG = DEFAULT_THRESHOLD_CONFIG
+
+# 数据库配置
+DB_CONFIG = {
+    'HOST': 'localhost',
+    'PORT': 3306,
+    'USER': 'aiops',
+    'PASSWORD': 'aiops123',
+    'NAME': 'aiops_monitoring'
+}
+
+# === tools/report_from_plan.py ===
+# tools/report_from_plan.py
+import os
+import pickle
+import time
+import json
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+
+# 导入任务计划类
+from tools.task_plan import SeriesInfo, TaskConfig, TaskPlan
+
+# 导入检测器
+from detectors import (
+    ZScoreDetector,
+    STLDetector,
+    CUSUMDetector,
+    ResidualComparisonDetector,
+    TrendDriftCUSUMDetector,
+    ChangeRateDetector,
+    TrendSlopeDetector
+)
+
+# 导入可视化和报告生成模块
+from output.visualization import generate_summary_echarts_html
+from output.report_generator import generate_report_single_series
+
+# 导入工具函数
+from utils.ts_cache import ensure_cache_file, load_series_from_cache
+
+def run_task_and_generate_report(task_plan_dict: dict) -> dict:
+    """
+    根据TaskPlan执行异常检测任务并生成可视化报告
+    
+    参数:
+        task_plan_dict: TaskPlan字典定义
+        
+    返回:
+        dict: 包含执行结果路径和摘要
+    """
+    # 解析任务计划
+    plan = TaskPlan.from_dict(task_plan_dict)
+    result_paths = []
+    
+    # 遍历执行每个任务
+    for task in plan.tasks:
+        # 创建任务输出目录
+        ts = int(time.time())
+        task_dir = os.path.join(plan.output_dir, f"{task.task_id}_{ts}")
+        os.makedirs(task_dir, exist_ok=True)
+        
+        # 处理单序列异常检测任务
+        if task.task_type == "single":
+            # 加载数据
+            s = task.series[0]
+            series = load_series_from_cache(s.ip, s.field, s.start, s.end)
+            
+            # 执行检测
+            results = [
+                ZScoreDetector().detect(series),
+                STLDetector().detect(series),
+                CUSUMDetector().detect(series)
+            ]
+            
+            # 筛选启用的方法（如果指定）
+            if task.enabled_methods:
+                results = [r for r in results if r.method in task.enabled_methods]
+            
+            # 生成图表和报告
+            chart_path = os.path.join(task_dir, "chart.html")
+            html_path = os.path.join(task_dir, "final_report.html")
+            
+            # 汇总可视化
+            chart_path, tooltip_map = generate_summary_echarts_html(
+                series, results, chart_path, 
+                title=f"{s.ip} {s.field} 异常检测汇总图"
+            )
+            
+            # 生成报告
+            generate_report_single_series(
+                plan.user_query, chart_path, results, tooltip_map, html_path
+            )
+            
+            result_paths.append(html_path)
+            
+        # 处理多序列对比检测任务
+        elif task.task_type == "pair":
+            # 加载两个序列数据
+            s1, s2 = task.series
+            series1 = load_series_from_cache(s1.ip, s1.field, s1.start, s1.end)
+            series2 = load_series_from_cache(s2.ip, s2.field, s2.start, s2.end)
+            
+            # 执行对比检测
+            results = [
+                ResidualComparisonDetector().detect(series1, series2),
+                TrendDriftCUSUMDetector().detect(series1, series2),
+                ChangeRateDetector().detect(series1, series2),
+                TrendSlopeDetector().detect(series1, series2)
+            ]
+            
+            # 筛选启用的方法（如果指定）
+            if task.enabled_methods:
+                results = [r for r in results if r.method in task.enabled_methods]
+            
+            # 生成图表和报告
+            chart_path = os.path.join(task_dir, "chart.html")
+            html_path = os.path.join(task_dir, "final_report.html")
+            
+            # 汇总可视化 - 为多序列对比实现特殊版本
+            chart_path, tooltip_map = generate_summary_echarts_html(
+                series1, results, chart_path,
+                title=f"{s1.ip} vs {s2.ip} 对比异常检测汇总图"
+            )
+            
+            # 生成报告
+            generate_report_single_series(
+                plan.user_query, chart_path, results, tooltip_map, html_path
+            )
+            
+            result_paths.append(html_path)
+            
+        # 暂不支持的任务类型
+        else:
+            print(f"[跳过] 暂不支持的 task_type: {task.task_type}")
+    
+    # 返回汇总结果
+    return {
+        "user_query": plan.user_query,
+        "summary": f"已完成 {len(result_paths)} 个任务的图表与报告生成。",
+        "report_paths": result_paths
+    }
+
+# === tools/task_plan.py ===
+# agent/tools/task_plan.py
+from typing import List, Optional
+
+class SeriesInfo:
+    def __init__(self, label: str, ip: str, field: str, start: str, end: str):
+        self.label = label                # 用户层面的标签（如“昨天”、“这周一”）
+        self.ip = ip                      # 数据源IP
+        self.field = field                # 指标名称（如 'cpu_rate'）
+        self.start = start                # 开始时间（'2025-03-27 00:00:00'）
+        self.end = end                    # 结束时间
+
+class TaskConfig:
+    def __init__(
+        self,
+        task_id: str,
+        task_type: str,                  # "single", "pair", "multivariate"
+        field: str,
+        series: List[SeriesInfo],
+        enabled_methods: Optional[List[str]] = None,
+        target_report_path: Optional[str] = None
+    ):
+        self.task_id = task_id
+        self.task_type = task_type
+        self.field = field
+        self.series = series
+        self.enabled_methods = enabled_methods or []
+        self.target_report_path = target_report_path
+
+class TaskPlan:
+    def __init__(
+        self,
+        user_query: str,
+        tasks: List[TaskConfig],
+        output_dir: str = "output/plots"
+    ):
+        self.user_query = user_query
+        self.tasks = tasks
+        self.output_dir = output_dir
+
+    @staticmethod
+    def from_dict(plan_dict: dict) -> "TaskPlan":
+        return TaskPlan(
+            user_query=plan_dict["user_query"],
+            output_dir=plan_dict.get("output_dir", "output/plots"),
+            tasks=[
+                TaskConfig(
+                    task_id=task["task_id"],
+                    task_type=task["task_type"],
+                    field=task["field"],
+                    series=[
+                        SeriesInfo(
+                            label=series.get("label", ""),
+                            ip=series["ip"],
+                            field=series.get("field", task["field"]),
+                            start=series["start"],
+                            end=series["end"]
+                        ) for series in task["series"]
+                    ],
+                    enabled_methods=task.get("enabled_methods"),
+                    target_report_path=task.get("target_report_path")
+                )
+                for task in plan_dict["tasks"]
+            ]
+        )
+
+
+# === tools/__init__.py ===
+# tools/__init__.py
+"""
+工具模块，包含任务计划和基于计划的报告生成功能
+"""
+
+from tools.task_plan import SeriesInfo, TaskConfig, TaskPlan
+
+# === utils/ts_cache.py ===
+# utils/ts_cache.py
+import os
+import pickle
+import hashlib
+import json
+import requests
+import datetime
+from typing import List, Tuple, Optional, Dict, Any
+
+# 配置
+CACHE_DIR = "cached_data"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# 后端API相关配置
+AIOPS_BACKEND_DOMAIN = 'https://aiopsbackend.cstcloud.cn'
+AUTH = ('chelseyyycheng@outlook.com', 'UofV1uwHwhVp9tcTue')
+
+def _cache_filename(ip: str, field: str, start_ts: int, end_ts: int) -> str:
+    """
+    生成缓存文件名
+    
+    参数:
+        ip: 主机IP
+        field: 指标字段
+        start_ts: 开始时间戳
+        end_ts: 结束时间戳
+    
+    返回:
+        str: 缓存文件路径
+    """
+    key = f"{ip}_{field}_{start_ts}_{end_ts}"
+    h = hashlib.md5(key.encode('utf-8')).hexdigest()
+    return os.path.join(CACHE_DIR, f"{h}.pkl")
+
+def fetch_data_from_backend(ip: str, field: str, start_ts: int, end_ts: int) -> List[Tuple[int, float]]:
+    """
+    从后端API获取时序数据
+    
+    参数:
+        ip: 主机IP
+        field: 指标字段
+        start_ts: 开始时间戳
+        end_ts: 结束时间戳
+    
+    返回:
+        List[Tuple[int, float]]: 时间戳-值的列表
+    """
+    url = f"{AIOPS_BACKEND_DOMAIN}/api/v1/monitor/mail/metric/format-value/?start={start_ts}&end={end_ts}&instance={ip}&field={field}"
+    resp = requests.get(url, auth=AUTH)
+    
+    if resp.status_code != 200:
+        raise Exception(f"后端请求失败: {resp.status_code} => {resp.text}")
+    
+    j = resp.json()
+    results = j.get("results", [])
+    if not results:
+        return []
+    
+    vals = results[0].get("values", [])
+    arr = []
+    
+    def parse_ts(s):
+        try:
+            dt = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+            return int(dt.timestamp())
+        except:
+            return 0
+    
+    for row in vals:
+        if len(row) >= 2:
+            tstr, vstr = row[0], row[1]
+            t = parse_ts(tstr)
+            try:
+                v = float(vstr)
+            except:
+                v = 0.0
+            arr.append([t, v])
+    
+    return arr
+
+def ensure_cache_file(ip: str, field: str, start: str, end: str) -> str:
+    """
+    确保缓存文件存在，如果不存在则从后端获取
+    
+    参数:
+        ip: 主机IP
+        field: 指标字段
+        start: 开始时间 (格式: "YYYY-MM-DD HH:MM:SS")
+        end: 结束时间 (格式: "YYYY-MM-DD HH:MM:SS")
+    
+    返回:
+        str: 缓存文件路径
+    """
+    # 转换时间字符串为时间戳
+    def to_int(s):
+        dt = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return int(dt.timestamp())
+    
+    st_i = to_int(start)
+    et_i = to_int(end)
+    
+    # 生成缓存文件路径
+    fpath = _cache_filename(ip, field, st_i, et_i)
+    
+    # 检查缓存是否存在
+    if os.path.exists(fpath):
+        print(f"[缓存] 从本地缓存读取 {ip} {field} 数据")
+        return fpath
+    
+    # 从后端获取数据
+    try:
+        print(f"[API] 从后端获取 {ip} {field} 数据")
+        data = fetch_data_from_backend(ip, field, st_i, et_i)
+        
+        # 保存到缓存
+        with open(fpath, "wb") as f:
+            pickle.dump(data, f)
+        
+        print(f"[缓存] 数据已写入缓存 {fpath}")
+        return fpath
+    
+    except Exception as e:
+        print(f"[错误] 获取数据失败: {e}")
+        return str(e)
+
+def load_series_from_cache(ip: str, field: str, start: str, end: str) -> List[Tuple[int, float]]:
+    """
+    从缓存加载时序数据
+    
+    参数:
+        ip: 主机IP
+        field: 指标字段
+        start: 开始时间 (格式: "YYYY-MM-DD HH:MM:SS")
+        end: 结束时间 (格式: "YYYY-MM-DD HH:MM:SS")
+    
+    返回:
+        List[Tuple[int, float]]: 时间戳-值的列表
+    """
+    # 确保缓存文件存在
+    cache_file = ensure_cache_file(ip, field, start, end)
+    
+    # 检查路径是否为错误信息
+    if not os.path.exists(cache_file):
+        raise Exception(f"缓存文件不存在: {cache_file}")
+    
+    # 从缓存加载数据
+    with open(cache_file, "rb") as f:
+        data = pickle.load(f)
+    
+    return data
+
+# === utils/__init__.py ===
+# utils/__init__.py
+"""
+工具函数模块，包含各种通用辅助函数
+"""
+from utils.time_utils import group_anomaly_times
+from utils.ts_cache import ensure_cache_file, load_series_from_cache
+
+# === utils/time_utils.py ===
+# utils/time_utils.py
+def group_anomaly_times(anomalies, max_gap=1800):
+    """
+    将时间戳列表分组为连续的时间区间
+    
+    参数:
+        anomalies: 时间戳列表
+        max_gap: 允许的最大间隔秒数
+        
+    返回:
+        list: [(start1, end1), (start2, end2), ...] 区间列表
+    """
+    if not anomalies:
+        return []
+    
+    # 排序输入
+    sorted_anomalies = sorted(anomalies)
+    
+    intervals = []
+    cur_start = sorted_anomalies[0]
+    cur_end = sorted_anomalies[0]
+    
+    for t in sorted_anomalies[1:]:
+        if t - cur_end <= max_gap:
+            cur_end = t
+        else:
+            intervals.append((cur_start, cur_end))
+            cur_start = t
+            cur_end = t
+    
+    # 添加最后一个区间
+    intervals.append((cur_start, cur_end))
+    
+    return intervals
+
+# === output/report_generator.py ===
+# output/report_generator.py
+import os
+import json
+import re
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+import config
+from output.visualization import generate_summary_echarts_html
+
+def generate_text_analysis(detection_results, composite_score, classification, series_info, is_multi_series=False):
+    """
+    生成易于理解的文字分析报告
+    
+    参数:
+        detection_results: 检测结果列表
+        composite_score: 综合得分
+        classification: 分类结果 ('正常', '轻度异常', '高置信度异常')
+        series_info: 关于数据的信息 {"ip": str, "field": str, "start": str, "end": str}
+        is_multi_series: 是否是多序列分析
+        
+    返回:
+        str: 结构化的文字分析报告
+    """
+    # 提取基本信息
+    ip = series_info.get("ip", "未知主机")
+    field = series_info.get("field", "未知指标")
+    start_time = series_info.get("start", "未知开始时间")
+    end_time = series_info.get("end", "未知结束时间")
+    
+    # 检测统计信息
+    total_anomalies = sum(len(result.anomalies) for result in detection_results)
+    total_intervals = sum(len(result.intervals) for result in detection_results)
+    methods_with_anomalies = [r.method for r in detection_results if len(r.anomalies) > 0 or len(r.intervals) > 0]
+    
+    # 格式化时间
+    try:
+        start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+        end_dt = datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
+        period_desc = f"{start_dt.strftime('%Y年%m月%d日 %H:%M')} 至 {end_dt.strftime('%Y年%m月%d日 %H:%M')}"
+    except:
+        period_desc = f"{start_time} 至 {end_time}"
+    
+    # 根据评分生成总体分析
+    if classification == "正常":
+        summary_line = f"系统运行正常，未发现明显异常。"
+        if total_anomalies > 0:
+            summary_line += f" 虽然检测到 {total_anomalies} 个可能的异常点，但整体影响较小，综合评分为 {composite_score:.2f}，低于异常阈值。"
+    elif classification == "轻度异常":
+        summary_line = f"系统运行存在轻微异常，综合评分为 {composite_score:.2f}。"
+        if total_anomalies > 0:
+            summary_line += f" 共检测到 {total_anomalies} 个异常点，可能需要关注。"
+    else:  # 高置信度异常
+        summary_line = f"系统运行存在明显异常，综合评分为 {composite_score:.2f}，超过高置信阈值。"
+        if total_anomalies > 0:
+            summary_line += f" 共检测到 {total_anomalies} 个异常点，强烈建议进一步分析。"
+    
+    # 构建详细分析报告
+    if is_multi_series:
+        ip1 = series_info.get("ip", "主机")
+        ip2 = series_info.get("ip2", "主机")
+        field = series_info.get("field", "指标")
+        
+        # 更具体的多序列分析摘要
+        analysis_text = f"""## {ip1} {field} 对比分析报告
+
+**分析时段**: {period_desc}
+
+**总体分析**: {summary_line}
+
+**对比结果摘要**: 对比分析了两个时间段的{field}数据，{"发现明显的差异模式" if classification != "正常" else "两个序列整体模式相似"}。
+"""
+        if total_anomalies > 0:
+            analysis_text += f"共检测到 {total_anomalies} 个异常点和 {total_intervals} 个异常区间。\n"
+        
+        analysis_text += "\n**检测方法详情**:\n"
+    else:
+        analysis_text = f"""## {ip} {field} 异常检测报告
+
+**分析时段**: {period_desc}
+
+**总体分析**: {summary_line}
+
+**检测方法详情**:
+"""
+
+    # 添加各个检测方法的详细分析
+    for result in detection_results:
+        # 跳过无异常的方法
+        if not result.anomalies and not result.intervals:
+            continue
+            
+        method_desc = result.description
+        
+        # 处理不同类型的异常
+        if result.visual_type == "point" and result.anomalies:
+            analysis_text += f"\n- **{result.method}**: 检测到 {len(result.anomalies)} 个异常点。"
+            
+            # 添加代表性异常的解释
+            if result.explanation and len(result.explanation) > 0:
+                max_examples = min(3, len(result.explanation))
+                analysis_text += " 典型异常表现为: "
+                for i in range(max_examples):
+                    # 尝试将时间戳转换为可读时间
+                    try:
+                        ts = result.anomalies[i]
+                        ts_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+                        analysis_text += f"{ts_str} - {result.explanation[i]}; "
+                    except:
+                        analysis_text += f"{result.explanation[i]}; "
+        
+        elif result.visual_type in ("range", "curve") and result.intervals:
+            analysis_text += f"\n- **{result.method}**: 检测到 {len(result.intervals)} 个异常区间。"
+            
+            # 添加代表性区间的解释
+            if result.explanation and len(result.explanation) > 0:
+                max_examples = min(2, len(result.explanation))
+                analysis_text += " 典型异常区间表现为: "
+                for i in range(max_examples):
+                    try:
+                        start, end = result.intervals[i]
+                        start_str = datetime.fromtimestamp(start).strftime("%H:%M:%S")
+                        end_str = datetime.fromtimestamp(end).strftime("%H:%M:%S")
+                        analysis_text += f"{start_str}至{end_str} - {result.explanation[i]}; "
+                    except:
+                        analysis_text += f"{result.explanation[i]}; "
+        
+        elif result.visual_type == "none" and result.explanation:
+            analysis_text += f"\n- **{result.method}**: {' '.join(result.explanation[:2])}"
+    
+    # 添加建议和结论
+    analysis_text += "\n\n**建议**:\n"
+    
+    if classification == "正常":
+        analysis_text += "- 系统运行状态良好，可继续当前运维策略。"
+    elif classification == "轻度异常":
+        analysis_text += f"- 关注 {field} 指标的变化趋势，尤其是 {', '.join(methods_with_anomalies[:2])} 检测到的异常点。\n"
+        analysis_text += "- 考虑设置该指标的监控告警，避免问题恶化。"
+    else:  # 高置信度异常
+        analysis_text += f"- 建议立即排查 {field} 指标异常的根本原因，特别是 {', '.join(methods_with_anomalies[:2])} 检测到的问题。\n"
+        analysis_text += "- 检查系统配置和相关依赖组件状态。\n"
+        analysis_text += "- 考虑与其他指标交叉分析，确定影响范围。"
+    
+    return analysis_text
+
+def generate_report_single(series, ip, field, user_query):
+    """
+    为单序列异常检测生成汇总报告
+    
+    参数:
+        series: 时序数据 [(ts, value), ...]
+        ip: 主机IP
+        field: 指标字段
+        user_query: 用户查询
+    
+    返回:
+        dict: 报告结果包含图表路径和分析结果
+    """
+    # 执行异常检测
+    from analysis.single_series import analyze_single_series
+    result = analyze_single_series(series)
+    method_results = result["method_results"]
+    
+    # 创建输出目录
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = f"output/plots/{ip}_{field}_{timestamp}"
+    os.makedirs(base_dir, exist_ok=True)
+    
+    # 提取时间信息构建 series_info
+    start_time = datetime.fromtimestamp(series[0][0]).strftime("%Y-%m-%d %H:%M:%S") if series else "未知"
+    end_time = datetime.fromtimestamp(series[-1][0]).strftime("%Y-%m-%d %H:%M:%S") if series else "未知"
+    
+    series_info = {
+        "ip": ip,
+        "field": field,
+        "start": start_time,
+        "end": end_time
+    }
+    
+    # 生成分析报告文字
+    analysis_text = generate_text_analysis(
+        method_results, 
+        result["composite_score"], 
+        result["classification"], 
+        series_info,
+        is_multi_series=False
+    )
+    
+    # 生成汇总图表
+    summary_path = os.path.join(base_dir, "summary.html")
+    chart_path, tooltip_map = generate_summary_echarts_html(
+        series, None, method_results, summary_path, 
+        title=f"{ip} {field} 异常检测汇总图"
+    )
+    
+    # 生成最终报告
+    final_report_path = os.path.join(base_dir, "final_report.html")
+    generate_report_single_series(
+        user_query, chart_path, method_results, tooltip_map, final_report_path, 
+        analysis_text=analysis_text, composite_score=result["composite_score"],
+        classification=result["classification"]  # 确保传递分类和得分
+    )
+    
+    # 返回结果
+    return {
+        "classification": result["classification"],
+        "composite_score": result["composite_score"],
+        "anomaly_times": result["anomaly_times"],
+        "method_results": [mr.to_dict() for mr in method_results],
+        "report_path": final_report_path,
+        "analysis_text": analysis_text
+    }
+
+def generate_report_multi(series1, series2, ip1, ip2, field, user_query):
+    """
+    为多序列对比异常检测生成汇总报告
+    
+    参数:
+        series1: 第一个时序数据 [(ts, value), ...]
+        series2: 第二个时序数据 [(ts, value), ...]
+        ip1: 第一个主机IP
+        ip2: 第二个主机IP
+        field: 指标字段
+        user_query: 用户查询
+    
+    返回:
+        dict: 报告结果包含图表路径和分析结果
+    """
+    # 执行多序列对比异常检测
+    from analysis.multi_series import analyze_multi_series
+    result = analyze_multi_series(series1, series2)
+    method_results = result["method_results"]
+    
+    # 创建输出目录
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = f"output/plots/{ip1}_{ip2}_{field}_{timestamp}"
+    os.makedirs(base_dir, exist_ok=True)
+    
+    # 提取时间信息构建 series_info
+    start_time = datetime.fromtimestamp(series1[0][0]).strftime("%Y-%m-%d %H:%M:%S") if series1 else "未知"
+    end_time = datetime.fromtimestamp(series1[-1][0]).strftime("%Y-%m-%d %H:%M:%S") if series1 else "未知"
+    
+    series_info = {
+        "ip": ip1,
+        "ip2": ip2,
+        "field": field,
+        "start": start_time,
+        "end": end_time
+    }
+    
+    # 生成分析报告文字
+    analysis_text = generate_text_analysis(
+        method_results, 
+        result["composite_score"], 
+        result["classification"], 
+        series_info,
+        is_multi_series=True
+    )
+    
+    # 生成汇总图表 - 传递两个序列
+    summary_path = os.path.join(base_dir, "summary.html")
+    chart_path, tooltip_map = generate_summary_echarts_html(
+        series1, series2, method_results, summary_path,
+        title=f"{ip1} vs {ip2} {field} 对比异常检测汇总图"
+    )
+    
+    # 生成最终报告
+    final_report_path = os.path.join(base_dir, "final_report.html")
+    generate_report_single_series(
+        user_query, chart_path, method_results, tooltip_map, final_report_path,
+        analysis_text=analysis_text, composite_score=result["composite_score"], 
+        classification=result["classification"]  # 确保传递分类和得分
+    )
+    
+    # 返回结果
+    return {
+        "classification": result["classification"],
+        "composite_score": result["composite_score"],
+        "anomaly_times": result["anomaly_times"],
+        "anomaly_intervals": result["anomaly_intervals"],
+        "method_results": [mr.to_dict() for mr in method_results],
+        "report_path": final_report_path,
+        "analysis_text": analysis_text
+    }
+
+def generate_report_single_series(user_query, chart_path, detection_results, tooltip_map, output_path, analysis_text=None, composite_score=0.0, classification="正常"):
+    """
+    生成单序列异常检测HTML报告
+    
+    参数:
+        user_query: 用户原始查询
+        chart_path: 图表HTML路径
+        detection_results: 检测结果列表
+        tooltip_map: 异常点/区间映射
+        output_path: 输出HTML报告路径
+        analysis_text: 可选，分析文本报告
+        composite_score: 综合得分
+        classification: 分类结果
+    
+    返回:
+        str: 生成的报告路径
+    """
+    # 使用传入的综合评分和分类，而不是重新计算
+    # 设置报告样式类
+    if classification == "高置信度异常":
+        alert_class = "alert-danger"
+    elif classification == "轻度异常":
+        alert_class = "alert-warning"
+    else:
+        alert_class = "alert-success"
+    
+    # 构建异常点说明HTML
+    anomaly_explanations_html = ""
+    for point_id, info in tooltip_map.items():
+        # 格式化时间戳
+        if "ts" in info:
+            time_str = datetime.fromtimestamp(info["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+            anomaly_explanations_html += f"""
+            <div class="card mb-2">
+                <div class="card-header">
+                    <strong>异常点 #{point_id}</strong> - {time_str}
+                </div>
+                <div class="card-body">
+                    <p><strong>方法:</strong> {info["method"]}</p>
+                    <p><strong>值:</strong> {info.get("value", "N/A")}</p>
+                    <p><strong>说明:</strong> {info["explanation"]}</p>
+                </div>
+            </div>
+            """
+        # 区间异常
+        elif "ts_start" in info and "ts_end" in info:
+            start_str = datetime.fromtimestamp(info["ts_start"]).strftime("%Y-%m-%d %H:%M:%S")
+            end_str = datetime.fromtimestamp(info["ts_end"]).strftime("%Y-%m-%d %H:%M:%S")
+            anomaly_explanations_html += f"""
+            <div class="card mb-2">
+                <div class="card-header">
+                    <strong>异常区间 #{point_id}</strong> - {start_str} 至 {end_str}
+                </div>
+                <div class="card-body">
+                    <p><strong>方法:</strong> {info["method"]}</p>
+                    <p><strong>说明:</strong> {info["explanation"]}</p>
+                </div>
+            </div>
+            """
+    
+    # 如果没有异常，显示正常信息
+    if not tooltip_map:
+        anomaly_explanations_html = """
+        <div class="alert alert-success">
+            <p>未检测到异常点。</p>
+        </div>
+        """
+    
+    # 构建方法摘要HTML
+    methods_summary_html = ""
+    for result in detection_results:
+        methods_summary_html += f"""
+        <div class="card mb-2">
+            <div class="card-header">
+                <strong>{result.method}</strong>
+            </div>
+            <div class="card-body">
+                <p>{result.description}</p>
+            </div>
+        </div>
+        """
+    
+    # 如果提供了分析文本，则转换成HTML格式
+    analysis_html = ""
+    if analysis_text:
+        # 替换Markdown格式为HTML格式，避免使用复杂的f-string转义
+        formatted_text = analysis_text.replace('\n', '<br>')
+        formatted_text = re.sub(r'## (.*)', r'<h3>\1</h3>', formatted_text)
+        formatted_text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', formatted_text)
+        formatted_text = re.sub(r'- (.*)', r'• \1<br>', formatted_text)
+        
+        analysis_html = f"""
+        <div class="card mb-4">
+            <div class="card-header">
+                <strong>分析报告摘要</strong>
+            </div>
+            <div class="card-body">
+                <div class="markdown-content">
+                    {formatted_text}
+                </div>
+            </div>
+        </div>
+        """
+    
+    # 构建完整HTML报告
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>异常检测报告</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {{ padding: 20px; }}
+        .iframe-container {{ width: 100%; height: 650px; border: none; }}
+        .markdown-content {{ line-height: 1.6; }}
+        .markdown-content h3 {{ margin-top: 20px; margin-bottom: 15px; color: #333; }}
+        .markdown-content strong {{ font-weight: 600; color: #444; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="mt-4 mb-4">时序数据异常检测报告</h1>
+        
+        <div class="card mb-4">
+            <div class="card-header">
+                <strong>用户问题</strong>
+            </div>
+            <div class="card-body">
+                <p>{user_query}</p>
+            </div>
+        </div>
+        
+        <div class="card mb-4">
+            <div class="card-header">
+                <strong>分析结论</strong>
+            </div>
+            <div class="card-body">
+                <div class="alert {alert_class}">
+                    <h4>综合判定: {classification}</h4>
+                    <p>综合得分: {composite_score:.2f}</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mb-4">
+            <div class="card-header">
+                <strong>异常检测图表</strong>
+            </div>
+            <div class="card-body p-0">
+                <iframe class="iframe-container" src="{os.path.basename(chart_path)}"></iframe>
+            </div>
+        </div>
+        
+        {analysis_html}
+        
+        <h2 class="mt-4 mb-3">异常点详细说明</h2>
+        {anomaly_explanations_html}
+        
+        <h2 class="mt-4 mb-3">检测方法摘要</h2>
+        {methods_summary_html}
+        
+        <footer class="mt-5 text-center text-muted">
+            <p>生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        </footer>
+    </div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>"""
+
+    # 写入文件
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    return output_path
+
+# === output/visualization.py ===
+# output/visualization.py
+import json
+import uuid
+import os
+import time
+from datetime import datetime
+from typing import List, Dict, Tuple, Any, Optional
+
+def generate_summary_echarts_html(series1, series2=None, detection_results=None, output_path=None, title="时序异常检测汇总图"):
+    """
+    生成融合所有方法的汇总异常检测可视化图表
+    
+    参数:
+        series1: 第一个时序数据 [(timestamp, value), ...]
+        series2: 可选，第二个时序数据，用于多序列对比
+        detection_results: 多个检测器结果列表 [DetectionResult, ...]
+        output_path: 输出HTML文件路径
+        title: 图表标题
+    
+    返回:
+        output_path: 输出的HTML文件路径
+        tooltip_map: 异常点映射，用于报告中解释关联
+    """
+    if detection_results is None:
+        detection_results = []
+        
+    chart_id = f"chart_summary_{uuid.uuid4().hex[:8]}"
+
+    # 主序列数据 - 修改名称和数据格式
+    series_list = [{
+        "name": series2 is not None and "上周CPU利用率" or "原始序列",
+        "type": "line",
+        "data": [[t * 1000, v] for t, v in series1],
+        "symbolSize": 0,  # 减小正常点的大小
+        "lineStyle": {"width": 2},
+        "itemStyle": {"color": "#5470C6"}
+    }]
+    
+    # 添加第二个序列（如果存在）
+    if series2 is not None:
+        # 将两个序列的时间范围对齐
+        min_time = min(series1[0][0], series2[0][0])
+        offset1 = series1[0][0] - min_time  # 第一个序列相对于较早开始时间的偏移
+        offset2 = series2[0][0] - min_time  # 第二个序列相对于较早开始时间的偏移
+        
+        # 将时间戳调整为相对时间，这样两个序列可以在图表上对齐
+        adjusted_series2 = [(t - offset2 + offset1, v) for t, v in series2]
+        
+        series_list.append({
+            "name": "这周CPU利用率",
+            "type": "line",
+            "data": [[t * 1000, v] for t, v in adjusted_series2],
+            "symbolSize": 0,  # 减小正常点的大小
+            "lineStyle": {"width": 2},
+            "itemStyle": {"color": "#91CC75"}
+        })
+        
+        # 添加差值曲线
+        if len(series1) == len(adjusted_series2):
+            diff_data = []
+            for i in range(len(series1)):
+                diff_data.append([series1[i][0] * 1000, series1[i][1] - adjusted_series2[i][1]])
+                
+            series_list.append({
+                "name": "差值曲线",
+                "type": "line",
+                "data": diff_data,
+                "symbolSize": 0,  # 减小正常点的大小
+                "lineStyle": {"width": 1, "type": "dashed"},
+                "itemStyle": {"color": "#EE6666"}
+            })
+
+    mark_points = []
+    mark_areas = []
+    extra_series = []
+    tooltip_map = {}
+
+    point_counter = 1  # 异常点序号
+    explanation_counter = 1  # 解释编号
+
+    for result in detection_results:
+        # 处理点异常
+        if result.visual_type == "point":
+            for i, ts in enumerate(result.anomalies):
+                value = next((v for t, v in series1 if t == ts), None)
+                if value is None:
+                    continue
+                
+                # 构建标签和提示信息
+                label = f"异常点#{point_counter}\n方法:{result.method}"
+                explanation = ""
+                if i < len(result.explanation):
+                    explanation = result.explanation[i]
+                    label += f"\n解释#{explanation_counter}"
+                    # 存储对应关系，用于报告生成
+                    tooltip_map[point_counter] = {
+                        "method": result.method,
+                        "ts": ts,
+                        "value": value,
+                        "explanation": explanation
+                    }
+                    explanation_counter += 1
+                
+                # 添加标记点
+                mark_points.append({
+                    "coord": [ts * 1000, value],
+                    "symbol": "circle",
+                    "symbolSize": 7,
+                    "itemStyle": {"color": "red"},
+                    "label": {"formatter": f"#{point_counter}", "show": True, "position": "top"},
+                    "tooltip": {"formatter": label}
+                })
+                point_counter += 1
+
+        # 处理区间异常
+        if result.visual_type in ("range", "curve"):
+            for i, (start, end) in enumerate(result.intervals):
+                # 获取区间解释
+                area_explanation = ""
+                if i < len(result.explanation):
+                    area_explanation = result.explanation[i]
+                
+                # 添加标记区域
+                mark_areas.append({
+                    "itemStyle": {"color": "rgba(255, 100, 100, 0.2)"},
+                    "label": {"show": True, "position": "top", "formatter": f"#{point_counter}"},
+                    "tooltip": {"formatter": f"异常区间#{point_counter}\n方法:{result.method}\n{area_explanation}"},
+                    "xAxis": start * 1000,
+                    "xAxis2": end * 1000
+                })
+                
+                # 存储对应关系
+                tooltip_map[point_counter] = {
+                    "method": result.method,
+                    "ts_start": start,
+                    "ts_end": end,
+                    "explanation": area_explanation
+                }
+                
+                point_counter += 1
+                explanation_counter += 1
+
+        # 处理辅助曲线 - 使用第二个y轴
+        if result.visual_type == "curve" and result.auxiliary_curve:
+            # 检查方法名来确定是否使用第二个Y轴
+            use_second_yaxis = result.method in ["CUSUM", "TrendDriftCUSUM"]
+            yAxisIndex = 1 if use_second_yaxis else 0
+            
+            curve_data = [[t * 1000, v] for t, v in result.auxiliary_curve]
+            extra_series.append({
+                "name": f"{result.method} 辅助曲线",
+                "type": "line",
+                "yAxisIndex": yAxisIndex,  # 使用右侧Y轴
+                "data": curve_data,
+                "lineStyle": {"type": "dashed", "width": 1.5},
+                "itemStyle": {"color": "#EE6666"},
+                "showSymbol": False
+            })
+
+    # 合并所有系列
+    series_list.extend(extra_series)
+    
+    # 检查是否需要第二个Y轴
+    need_second_yaxis = any(s.get("yAxisIndex", 0) == 1 for s in series_list)
+
+    # 构建 ECharts 选项
+    option = {
+        "title": {"text": title, "left": "center"},
+        "tooltip": {"trigger": "axis", "axisPointer": {"type": "cross"}},
+        "legend": {"top": 30, "data": [s["name"] for s in series_list]},
+        "grid": {"left": "3%", "right": need_second_yaxis and "8%" or "4%", "bottom": "3%", "containLabel": True},
+        "toolbox": {
+            "feature": {
+                "saveAsImage": {},
+                "dataZoom": {},
+                "restore": {}
+            }
+        },
+        "xAxis": {
+            "type": "time",
+            "name": "时间",
+            "axisLabel": {"formatter": "{yyyy}-{MM}-{dd} {HH}:{mm}"}
+        },
+        "yAxis": [
+            {"type": "value", "name": "数值", "position": "left"}
+        ],
+        "series": series_list,
+        "dataZoom": [
+            {"type": "slider", "show": True, "xAxisIndex": [0], "start": 0, "end": 100},
+            {"type": "inside", "xAxisIndex": [0], "start": 0, "end": 100}
+        ]
+    }
+    
+    # 添加第二个Y轴（如果需要）
+    if need_second_yaxis:
+        option["yAxis"].append({
+            "type": "value",
+            "name": "辅助曲线值",
+            "position": "right",
+            "splitLine": {"show": False}
+        })
+
+    # 整合标记点和标记区域
+    if mark_points:
+        series_list[0]["markPoint"] = {"data": mark_points, "symbolSize": 8}
+    
+    if mark_areas:
+        series_list[0]["markArea"] = {
+            "data": [[{"xAxis": area["xAxis"], "itemStyle": area["itemStyle"]}, 
+                     {"xAxis": area["xAxis2"]}] for area in mark_areas]
+        }
+
+    # 生成HTML
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>{title}</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+</head>
+<body>
+    <div id="{chart_id}" style="width:100%; height:600px;"></div>
+    <script>
+        var chart = echarts.init(document.getElementById('{chart_id}'));
+        var option = {json.dumps(option, ensure_ascii=False)};
+        chart.setOption(option);
+        window.addEventListener('resize', function() {{
+            chart.resize();
+        }});
+    </script>
+</body>
+</html>"""
+
+    # 确保输出目录存在
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # 写入文件
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        return output_path, tooltip_map
+    else:
+        return html, tooltip_map
+
+
+# 向后兼容函数
+def generate_echarts_html_single(series, anomalies, title="单序列异常检测"):
+    """
+    向后兼容函数 - 生成单序列异常检测图表
+    """
+    from detectors.base import DetectionResult
+    import time
+    
+    # 将旧格式转换为检测结果对象
+    result = DetectionResult(
+        method="Legacy",
+        anomalies=anomalies,
+        description="旧版接口生成的异常检测图表",
+        visual_type="point"
+    )
+    
+    path = f"output/plots/legacy_single_{int(time.time())}.html"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    
+    chart_path, _ = generate_summary_echarts_html(
+        series, None, [result], path, title
+    )
+    
+    return chart_path
+
+def generate_echarts_html_multi(series1, series2, anomalies, title="多序列对比异常检测"):
+    """
+    向后兼容函数 - 生成多序列对比异常检测图表
+    """
+    from detectors.base import DetectionResult
+    import time
+    
+    # 将旧格式转换为检测结果对象
+    result = DetectionResult(
+        method="Legacy",
+        anomalies=anomalies,
+        description="旧版接口生成的异常检测图表",
+        visual_type="point"
+    )
+    
+    path = f"output/plots/legacy_multi_{int(time.time())}.html"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    
+    chart_path, _ = generate_summary_echarts_html(
+        series1, series2, [result], path, title
+    )
+    
+    return chart_path
+
+# === output/analysis_summary.py ===
+# output/analysis_summary.py
+import datetime
+from typing import List, Dict, Any
+
+def generate_text_analysis(detection_results: List, composite_score: float, classification: str, 
+                          series_info: Dict, is_multi_series: bool = False) -> str:
+    """
+    生成易于理解的文字分析报告
+    
+    参数:
+        detection_results: 检测结果列表
+        composite_score: 综合得分
+        classification: 分类结果 ('正常', '轻度异常', '高置信度异常')
+        series_info: 关于数据的信息 {"ip": str, "field": str, "start": str, "end": str}
+        is_multi_series: 是否是多序列分析
+        
+    返回:
+        str: 结构化的文字分析报告
+    """
+    # 提取基本信息
+    ip = series_info.get("ip", "未知主机")
+    field = series_info.get("field", "未知指标")
+    start_time = series_info.get("start", "未知开始时间")
+    end_time = series_info.get("end", "未知结束时间")
+    
+    # 检测统计信息
+    total_anomalies = sum(len(result.anomalies) for result in detection_results)
+    total_intervals = sum(len(result.intervals) for result in detection_results)
+    methods_with_anomalies = [r.method for r in detection_results if len(r.anomalies) > 0 or len(r.intervals) > 0]
+    
+    # 格式化时间
+    try:
+        start_dt = datetime.datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+        end_dt = datetime.datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
+        period_desc = f"{start_dt.strftime('%Y年%m月%d日 %H:%M')} 至 {end_dt.strftime('%Y年%m月%d日 %H:%M')}"
+    except:
+        period_desc = f"{start_time} 至 {end_time}"
+    
+    # 根据评分生成总体分析
+    if classification == "正常":
+        summary_line = f"系统运行正常，未发现明显异常。"
+        if total_anomalies > 0:
+            summary_line += f" 虽然检测到 {total_anomalies} 个可能的异常点，但整体影响较小，综合评分为 {composite_score:.2f}，低于异常阈值。"
+    elif classification == "轻度异常":
+        summary_line = f"系统运行存在轻微异常，综合评分为 {composite_score:.2f}。"
+        if total_anomalies > 0:
+            summary_line += f" 共检测到 {total_anomalies} 个异常点，可能需要关注。"
+    else:  # 高置信度异常
+        summary_line = f"系统运行存在明显异常，综合评分为 {composite_score:.2f}，超过高置信阈值。"
+        if total_anomalies > 0:
+            summary_line += f" 共检测到 {total_anomalies} 个异常点，强烈建议进一步分析。"
+    
+    # 构建详细分析报告
+    if is_multi_series:
+        ip2 = series_info.get("ip2", "第二组数据")
+        analysis_text = f"""## {ip} vs {ip2} {field} 对比分析报告
+
+**分析时段**: {period_desc}
+
+**总体分析**: {summary_line}
+
+**检测方法详情**:
+"""
+    else:
+        analysis_text = f"""## {ip} {field} 异常检测报告
+
+**分析时段**: {period_desc}
+
+**总体分析**: {summary_line}
+
+**检测方法详情**:
+"""
+
+    # 添加各个检测方法的详细分析
+    for result in detection_results:
+        # 跳过无异常的方法
+        if not result.anomalies and not result.intervals:
+            continue
+            
+        method_desc = result.description
+        
+        # 处理不同类型的异常
+        if result.visual_type == "point" and result.anomalies:
+            analysis_text += f"\n- **{result.method}**: 检测到 {len(result.anomalies)} 个异常点。"
+            
+            # 添加代表性异常的解释
+            if result.explanation and len(result.explanation) > 0:
+                max_examples = min(3, len(result.explanation))
+                analysis_text += " 典型异常表现为: "
+                for i in range(max_examples):
+                    # 尝试将时间戳转换为可读时间
+                    try:
+                        ts = result.anomalies[i]
+                        ts_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+                        analysis_text += f"{ts_str} - {result.explanation[i]}; "
+                    except:
+                        analysis_text += f"{result.explanation[i]}; "
+        
+        elif result.visual_type in ("range", "curve") and result.intervals:
+            analysis_text += f"\n- **{result.method}**: 检测到 {len(result.intervals)} 个异常区间。"
+            
+            # 添加代表性区间的解释
+            if result.explanation and len(result.explanation) > 0:
+                max_examples = min(2, len(result.explanation))
+                analysis_text += " 典型异常区间表现为: "
+                for i in range(max_examples):
+                    try:
+                        start, end = result.intervals[i]
+                        start_str = datetime.datetime.fromtimestamp(start).strftime("%H:%M:%S")
+                        end_str = datetime.datetime.fromtimestamp(end).strftime("%H:%M:%S")
+                        analysis_text += f"{start_str}至{end_str} - {result.explanation[i]}; "
+                    except:
+                        analysis_text += f"{result.explanation[i]}; "
+        
+        elif result.visual_type == "none" and result.explanation:
+            analysis_text += f"\n- **{result.method}**: {' '.join(result.explanation[:2])}"
+    
+    # 添加建议和结论
+    analysis_text += "\n\n**建议**:\n"
+    
+    if classification == "正常":
+        analysis_text += "- 系统运行状态良好，可继续当前运维策略。"
+    elif classification == "轻度异常":
+        analysis_text += f"- 关注 {field} 指标的变化趋势，尤其是 {', '.join(methods_with_anomalies[:2])} 检测到的异常点。\n"
+        analysis_text += "- 考虑设置该指标的监控告警，避免问题恶化。"
+    else:  # 高置信度异常
+        analysis_text += f"- 建议立即排查 {field} 指标异常的根本原因，特别是 {', '.join(methods_with_anomalies[:2])} 检测到的问题。\n"
+        analysis_text += "- 检查系统配置和相关依赖组件状态。\n"
+        analysis_text += "- 考虑与其他指标交叉分析，确定影响范围。"
+    
+    return analysis_text
+
+# === output/__init__.py ===
+
+
+# === test/testfile.py ===
+import os
+
+def dump_project_code(project_root, output_file="project_code_dump.txt"):
+    with open(output_file, "w", encoding="utf-8") as out:
+        for root, _, files in os.walk(project_root):
+            if "__pycache__" in root:
+                continue
+            for file in files:
+                if file.endswith(".py"):
+                    file_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(file_path, project_root)
+                    out.write(f"# === {rel_path} ===\n")
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        out.write(f.read())
+                    out.write("\n\n")
+
+project_path = "/home/cnic/aiagent1"  
+dump_project_code(project_path)
+
+
+# === test/mail_test.py ===
+#! /usr/bin/env python3
+import re
+import json
+import datetime
+import requests
+from django.conf import settings
+
+AIOPS_BACKEND_DOMAIN = 'https://aiopsbackend.cstcloud.cn'
+LLM_URL = 'http://10.16.1.16:58000/v1/chat/completions'
+
+AUTH = ('chelseyyycheng@outlook.com', 'UofV1uwHwhVp9tcTue')
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "请求智能运管后端Api，获取指标项的时序数据",
+            "description": "请求智能运管后端Api，获取指标项的时序数据",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ip": {
+                        "type": "string",
+                        "description": "要查询的ip"
+                    },
+                    "start": {
+                        "type": "string",
+                        "description": "日期，格式为 Y-%m-%d %H:%M:%S"
+                    },
+                    "end": {
+                        "type": "string",
+                        "description": "日期，格式为 Y-%m-%d %H:%M:%S"
+                    },
+                    "field": {
+                        "type": "string",
+                        "description": "监控项名称，只可在监控项列表中选择"
+                    },
+                },
+                "required": ["ip", "start", "end", "field"],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "请求智能运管后端Api，查询监控实例有哪些监控项",
+            "description": "请求智能运管后端Api，查询监控实例有哪些监控项",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service": {
+                        "type": "string",
+                        "description": "要查询的系统名称"
+                    },
+                    "instance": {
+                        "type": "string",
+                        "description": "要查询的监控实例"
+                    },
+                },
+                "required": ["service", "instance"],
+
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "请求智能运管后端Api，查询监控实例之间的拓扑关联关系",
+            "description": "监控实例上联了哪些监控实例列表，下联了哪些监控实例列表",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service": {
+                        "type": "string",
+                        "description": "要查询的系统名称"
+                    },
+                    "instance_ip": {
+                        "type": "string",
+                        "description": "要查询的监控实例的IP地址"
+                    },
+                },
+                "required": ["service", 'instance_ip'],
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "请求智能运管后端Api，查询监控服务的资产情况和监控实例",
+            "description": "请求智能运管后端Api，查询监控服务的资产情况和监控实例",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "service": {
+                        "type": "string",
+                        "description": "要查询的系统名称"
+                    },
+                },
+                "required": ["service"],
+
+            }
+        }
+    },
+
+]
+
+
+def monitor_item_list(ip):
+    url = f'{AIOPS_BACKEND_DOMAIN}/api/v1/monitor/mail/machine/field/?instance={ip}'
+    resp = requests.get(url=url, auth=AUTH)
+    text = json.loads(resp.text)
+    result = dict()
+    if resp.status_code == 200:
+        for item in text:
+            result[item.get('field')] = item.get('purpose')
+        return result
+    else:
+        return text
+
+
+def get_service_asset(service):
+    url = f'{AIOPS_BACKEND_DOMAIN}/api/v1/property/mail/?ordering=num_id&page=1&page_size=2000'
+    resp = requests.get(url=url, auth=AUTH)
+    text = json.loads(resp.text)
+    results = text.get('results')
+    item_list = []
+    for _ in results:
+        _['category'] = _.get('category').get('name')
+        _["ip_set"] = [_.get("ip") for _ in _.get('ip_set')]
+        _.pop('num_id')
+        _.pop('creation')
+        _.pop('modification')
+        _.pop('remark')
+        _.pop('sort_weight')
+        _.pop('monitor_status')
+        for k, v in _.copy().items():
+            if not v or v == '无':
+                _.pop(k)
+        item_list.append(_)
+    return item_list
+
+
+def get_service_asset_edges(service, instance_ip):
+    url = f'{AIOPS_BACKEND_DOMAIN}/api/v1/property/mail/topology/search?instance={instance_ip}'
+    resp = requests.get(url=url, auth=AUTH)
+    text = json.loads(resp.text)
+    # print(text)
+    return text
+
+
+def get_monitor_metric_value(ip, start, end, field):
+    metric_field_list = monitor_item_list(ip)
+    if field not in metric_field_list.keys():
+        return f"未知的监控项：{field}"
+    # 查询监控指标情况
+    start_timestamp = datetime.datetime.strptime(start, "%Y-%m-%d %H:%M:%S").timestamp()
+    end_timestamp = datetime.datetime.strptime(end, "%Y-%m-%d %H:%M:%S").timestamp()
+    url = f'{AIOPS_BACKEND_DOMAIN}/api/v1/monitor/mail/metric/format-value/?start={start_timestamp}&end={end_timestamp}&instance={ip}&field={field}'
+    resp = requests.get(url=url, auth=AUTH)
+    text = resp.text
+    text = json.loads(text)
+    return text
+
+
+# ------------------------------------------------------------------------
+
+
+def llm_call(messages):
+    # for _ in messages:
+    #     print(_)
+    #     print('\n')
+    data = {
+        "model": "Qwen2.5-14B-Instruct",
+        "temperature": 0.1,
+        "messages": messages,
+    }
+    response = requests.post(LLM_URL, json=data)
+    if response.status_code == 200:
+        response_data = response.json()
+        if 'choices' in response_data and len(response_data['choices']) > 0:
+            generated_content = response_data['choices'][0]['message']['content']
+            # print('##Token使用情况##:\n\n', response_data['usage'])
+            # print('------------------\n\n')
+            return response_data['choices'][0]['message']
+        else:
+            print(response_data)
+            raise Exception("模型没有返回信息")
+    else:
+        print(f'Error: {response.status_code}')
+        print(response.text)
+
+
+def init_message_by_role(role, content):
+    message = {
+        'role': role,
+        "content": content
+    }
+    return message
+
+
+def parse_llm_response(llm_resp_content):
+    invalid_value = ["空", '无']
+    thought_match = re.search(r'<思考过程>(.*)</思考过程>', llm_resp_content, re.S)
+    if thought_match and thought_match[0] not in invalid_value:
+        thought = thought_match.group(1)
+    else:
+        thought = ""
+    action_match = re.search(r'<工具调用>(.*)</工具调用>', llm_resp_content)
+    if action_match and action_match[0] not in invalid_value:
+        action = action_match.group(1)
+    else:
+        action = ""
+    action_input_match = re.search(r'<调用参数>(.*)</调用参数>', llm_resp_content)
+    if action_input_match and action_input_match[0] not in invalid_value:
+        action_input = action_input_match.group(1)
+    else:
+        action_input = ""
+    if "<最终答案>" in llm_resp_content and "</最终答案>" not in llm_resp_content:
+        llm_resp_content += "</最终答案>"
+    final_answer_match = re.search(r'<最终答案>(.*)</最终答案>', llm_resp_content, re.S)
+    if final_answer_match and final_answer_match[0] not in invalid_value:
+        final_answer = final_answer_match.group(1)
+    else:
+        final_answer = ""
+    result = {
+        'thought': thought,
+        'action': action,
+        'action_input': action_input,
+        'final_answer': final_answer,
+    }
+    return result
+
+
+def react(llm_resp_content):
+    is_final = False
+    llm_parsed_dict = parse_llm_response(llm_resp_content)
+    # print("##解析后的参数", llm_parsed_dict)
+    action = llm_parsed_dict.get('action')
+    action_input = llm_parsed_dict.get('action_input')
+    final_answer = llm_parsed_dict.get('final_answer')
+    # print("当前的大模型解析", llm_parsed_dict)
+    if action and action_input:
+        # print("##调用函数##", action, action_input)
+        action_input = json.loads(action_input)
+        if action == '请求智能运管后端Api，获取指标项的时序数据':
+            return get_monitor_metric_value(**action_input), is_final
+        if action == '请求智能运管后端Api，查询监控实例有哪些监控项':
+            return monitor_item_list(action_input.get('instance')), is_final
+        if action == '请求智能运管后端Api，查询监控服务的资产情况和监控实例':
+            return get_service_asset(action_input.get('service')), is_final
+        if action == "请求智能运管后端Api，查询监控实例之间的拓扑关联关系":
+            return get_service_asset_edges(**action_input), is_final
+    if final_answer:
+        is_final = True
+        return final_answer, is_final
+    else:
+        result = """
+生成的文本格式有误，严格按照以下指定格式生成响应：
+```
+<思考过程>你的思考过程</思考过程>
+<工具调用>工具名称（必须是{tool_names}之一），如果不调用工具，则为空</工具调用>
+<调用参数>工具输入参数（严格符合工具描述格式）</调用参数>
+<最终答案>用户问题的最终结果（知道问题的最终答案时返回）</最终答案>
+```
+"""
+        return result, is_final
+
+
+def stream_response_format(category, content):
+    data = f'data: {json.dumps({category: content}, ensure_ascii=False)}\n\n'
+    return data
+
+
+def chat(user_content):
+    system_template = '''你是一个严格遵守格式规范的用于运维功能，运维数据可视化，运行于生产环境的ReAct智能体，你叫小助手，必须按以下格式处理请求：
+
+    可用工具：
+    {tools}
+
+    处理规则：
+    1.根据用户的问题来自行判断是否要调用工具以及调用哪个工具
+    2.每次只能调用一个工具
+    3.不能伪造数据
+    3.严格按照以下xml格式生成响应文本：
+    ```
+    <思考过程>你的思考过程</思考过程>
+    <工具调用>工具名称（必须是{tool_names}之一），如果不调用工具，则为空</工具调用>
+    <调用参数>工具输入参数（严格符合工具描述格式）</调用参数>
+    <最终答案>用户问题的最终结果（知道问题的最终答案时返回）</最终答案>
+    ```
+    '''
+    history = list()
+    history.append(init_message_by_role(
+        role='system',
+        content=system_template.format(
+            tools=json.dumps(tools, ensure_ascii=False),
+            tool_names=json.dumps([tool["function"]["name"] for tool in tools], ensure_ascii=False), )
+    ))
+    current_datetime = str(datetime.datetime.now()).split('.')[0]
+    history.append(init_message_by_role(role='user', content=f'当前时间是 {current_datetime}'))
+    history.append(init_message_by_role(role='user', content=user_content))
+    count = 1
+    while True:
+        print(f'第{count}次循环')
+        llm_resp_message = llm_call(history)
+        print('##大模型响应##', llm_resp_message)
+        history.append(llm_resp_message)
+        response, is_final_flag = react(llm_resp_message.get('content'))
+        history.append(init_message_by_role(role='user', content=f"<工具调用结果>: {response}</工具调用结果>"))
+        if is_final_flag:
+            print(response)
+            return
+        count += 1
+        if count >= 15:
+            response = llm_resp_message.get('content')
+            print(response)
+            return
+
+
+if __name__ == '__main__':
+    # chat('你好')
+    chat(
+        '我想查询邮件系统 192.168.0.110 这台主机今天1点到1点30分的cpu利用率，并给出echarts折线图的完整html，并进行分析给出分析报告')
+
+
+# === analysis/multi_series.py ===
+# analysis/multi_series.py
+import config
+import math
+import numpy as np
+import logging
+from utils.time_utils import group_anomaly_times
+from detectors.base import DetectionResult
+
+logger = logging.getLogger("anomaly_detection.multi_series")
+
+def analyze_multi_series(series1, series2, align=True):
+    """
+    对两个时间序列进行对比分析
+    
+    参数:
+        series1: 第一个时间序列
+        series2: 第二个时间序列
+        align: 是否对齐时间戳
+        
+    返回:
+        dict: 包含分析结果的字典
+    """
+    # 输入参数验证
+    if not series1 or not series2:
+        logger.warning("输入时间序列为空")
+        return {
+            "method_results": [],
+            "composite_score": 0,
+            "classification": "正常",
+            "anomaly_times": [],
+            "anomaly_intervals": []
+        }
+    
+    # 导入放在函数内部避免循环引用
+    from detectors.residual_comparison import ResidualComparisonDetector
+    from detectors.trend_drift_cusum import TrendDriftCUSUMDetector
+    from detectors.change_rate import ChangeRateDetector
+    from detectors.trend_slope import TrendSlopeDetector
+    from analysis.data_alignment import align_series
+    
+    # 检查两个序列是否有足够的差异
+    values1 = [v for _, v in series1]
+    values2 = [v for _, v in series2]
+    
+    if align:
+        try:
+            series1, series2 = align_series(series1, series2, method="linear", fill_value="extrapolate")
+            logger.info("成功对齐两个时间序列")
+        except Exception as e:
+            logger.error(f"时间序列对齐失败: {e}")
+            # 继续使用原始序列
+    
+    # 计算两个序列的相似度
+    try:
+        mean_abs_diff = np.mean(np.abs(np.array(values1) - np.array(values2)))
+        relative_diff = mean_abs_diff / (np.mean(np.abs(values1)) + 1e-10)
+        
+        logger.info(f"两序列的相对差异: {relative_diff:.1%}")
+        # 如果差异极小，可能不需要详细分析
+        if relative_diff < 0.05:  # 小于5%的差异
+            logger.info("序列几乎相同，无需详细分析")
+            return {
+                "method_results": [],
+                "composite_score": 0,
+                "classification": "正常",
+                "anomaly_times": [],
+                "anomaly_intervals": []
+            }
+    except Exception as e:
+        logger.warning(f"计算序列差异失败: {e}")
+        # 继续分析
+
+    # 加载阈值配置
+    thres = config.THRESHOLD_CONFIG
+    
+    # 执行各个检测方法
+    detection_results = []
+    
+    # 1. 残差对比方法
+    try:
+        res_residual = ResidualComparisonDetector(
+            threshold=thres.get("ResidualComparison", {}).get("threshold", 3.5)
+        ).detect(series1, series2)
+        detection_results.append(res_residual)
+        logger.info(f"残差对比检测到 {len(res_residual.anomalies)} 个异常点")
+    except Exception as e:
+        logger.error(f"残差对比检测失败: {e}")
+    
+    # 2. 趋势漂移CUSUM方法
+    try:
+        res_drift = TrendDriftCUSUMDetector(
+            threshold=thres.get("TrendDriftCUSUM", {}).get("drift_threshold", 8.0)
+        ).detect(series1, series2)
+        detection_results.append(res_drift)
+        logger.info(f"趋势漂移检测到 {len(res_drift.intervals)} 个异常区间")
+    except Exception as e:
+        logger.error(f"趋势漂移检测失败: {e}")
+    
+    # 3. 变化率方法
+    try:
+        res_change = ChangeRateDetector(
+            threshold=thres.get("ChangeRate", {}).get("threshold", 0.7)
+        ).detect(series1, series2)
+        detection_results.append(res_change)
+        logger.info(f"变化率检测到 {len(res_change.explanation)} 个文本解释")
+    except Exception as e:
+        logger.error(f"变化率检测失败: {e}")
+    
+    # 4. 趋势斜率方法
+    try:
+        res_slope = TrendSlopeDetector(
+            threshold=thres.get("TrendSlope", {}).get("slope_threshold", 0.4),
+            window=thres.get("TrendSlope", {}).get("window", 5)
+        ).detect(series1, series2)
+        detection_results.append(res_slope)
+        logger.info(f"趋势斜率检测到 {len(res_slope.anomalies)} 个异常点")
+    except Exception as e:
+        logger.error(f"趋势斜率检测失败: {e}")
+
+    # 过滤无效结果
+    method_results = [
+        r for r in detection_results if r is not None
+    ]
+    
+    if not method_results:
+        logger.warning("所有检测方法都失败")
+        return {
+            "method_results": [],
+            "composite_score": 0,
+            "classification": "正常",
+            "anomaly_times": [],
+            "anomaly_intervals": []
+        }
+
+    # 计算综合得分
+    total_weight = 0.0
+    composite_score = 0.0
+    length = max(len(series1), len(series2)) or 1
+    
+    # 方法有意义的分数
+    method_scores = {}
+
+    for res in method_results:
+        m_name = res.method
+        weight = config.WEIGHTS_MULTI.get(m_name, 0.25)  # 默认权重0.25
+        total_weight += weight
+        
+        # 计算方法得分
+        if res.visual_type == "none" and res.explanation:
+            # 纯文本解释型检测器
+            # 根据解释的数量和内容评估得分
+            has_significant_diff = any(("差异较大" in expl or "明显" in expl) 
+                                      for expl in res.explanation)
+            method_score = 0.4 if has_significant_diff else 0.2 if res.explanation else 0
+        else:
+            # 可视化型检测器
+            anomaly_count = len(res.anomalies)
+            interval_count = len(res.intervals) * 3  # 区间异常权重更高
+            total_count = anomaly_count + interval_count
+            
+            if total_count > 0:
+                # 计算异常比例
+                if m_name == "TrendDriftCUSUM":
+                    # TrendDriftCUSUM方法特殊处理
+                    # 根据区间覆盖的时间比例来评估
+                    total_duration = 0
+                    for start, end in res.intervals:
+                        total_duration += (end - start)
+                    
+                    coverage_ratio = total_duration / (series1[-1][0] - series1[0][0] + 1)
+                    # 调整分数，减少过度敏感
+                    if coverage_ratio > 0.5:  # 覆盖超过50%
+                        method_score = min(0.7, 0.4 + 0.3 * coverage_ratio)
+                    else:
+                        method_score = 0.3 * coverage_ratio
+                else:
+                    # 其他方法使用对数缩放的点/区间数量
+                    anomaly_ratio = total_count / length
+                    if anomaly_ratio < 0.01:  # 低于1%的异常率
+                        method_score = 0.2 + 0.3 * (anomaly_ratio * 100)  # 线性调整
+                    else:
+                        method_score = min(0.8, 0.2 + 0.3 * np.log10(1 + anomaly_ratio * 100))
+            else:
+                method_score = 0
+        
+        # 记录各方法得分
+        method_scores[m_name] = method_score
+        composite_score += weight * method_score
+        logger.info(f"方法 {m_name} 得分: {method_score:.2f}, 权重: {weight}")
+
+    if total_weight > 0:
+        composite_score /= total_weight
+
+    # 添加置信度调整
+    methods_with_anomalies = sum(1 for res in method_results 
+                              if (len(res.anomalies) > 0 or 
+                                  len(res.intervals) > 0 or 
+                                  (res.visual_type == "none" and len(res.explanation) > 0)))
+    
+    if methods_with_anomalies == 1 and len(method_results) > 1:
+        logger.info("仅一个方法检测到异常，降低得分")
+        composite_score *= 0.8  # 降低20%
+    
+    # 检查趋势漂移CUSUM的得分是否过高
+    if "TrendDriftCUSUM" in method_scores and method_scores["TrendDriftCUSUM"] > 0.5:
+        # 如果其他方法都没有明显异常，可能是误报
+        other_methods_score = sum(score for name, score in method_scores.items() 
+                                if name != "TrendDriftCUSUM") / max(1, len(method_scores) - 1)
+        
+        if other_methods_score < 0.2:  # 其他方法平均得分很低
+            logger.warning("TrendDriftCUSUM可能误报，降低总得分")
+            # 降低综合得分
+            composite_score = (composite_score + other_methods_score) / 2
+
+    # 确定分类
+    classification = (
+        "高置信度异常" if composite_score >= config.HIGH_ANOMALY_THRESHOLD
+        else "轻度异常" if composite_score >= config.MILD_ANOMALY_THRESHOLD
+        else "正常"
+    )
+    
+    logger.info(f"综合得分: {composite_score:.2f}, 分类: {classification}")
+
+    # 合并所有异常点
+    all_anoms = set()
+    for r in method_results:
+        all_anoms.update(r.anomalies)
+    anomaly_list = sorted(all_anoms)
+    
+    # 检查异常点是否太多（可能是误报）
+    anomaly_ratio = len(anomaly_list) / length if length > 0 else 0
+    if anomaly_ratio > 0.25:  # 超过25%是异常点
+        logger.warning(f"异常点比例高达 {anomaly_ratio:.1%}，重新评估分类")
+        # 对于大量异常点，需要多个方法一致确认才算高置信度异常
+        if methods_with_anomalies < len(method_results) * 0.7:  # 少于70%的方法都检测到异常
+            if classification == "高置信度异常":
+                classification = "轻度异常"
+                logger.info("降级为轻度异常")
+            elif classification == "轻度异常" and anomaly_ratio > 0.4:
+                classification = "正常"
+                logger.info("降级为正常")
+    
+    # 分组时间区间
+    intervals = group_anomaly_times(anomaly_list)
+
+    return {
+        "method_results": method_results,
+        "composite_score": composite_score,
+        "classification": classification,
+        "anomaly_times": anomaly_list,
+        "anomaly_intervals": intervals
+    }
+
+# === analysis/data_alignment.py ===
+# 文件: analysis/data_alignment.py
+import numpy as np
+from scipy.interpolate import interp1d
+
+def align_series(series1, series2, method="linear", fill_value="extrapolate"):
+    
+    #使用SciPy的interp1d进行插值，将series1和series2在相同的时间戳上对齐。
+    if not series1 or not series2:
+        return series1, series2
+
+    s1_sorted = sorted(series1, key=lambda x: x[0])
+    s2_sorted = sorted(series2, key=lambda x: x[0])
+
+    t1 = np.array([row[0] for row in s1_sorted], dtype=np.float64)
+    v1 = np.array([row[1] for row in s1_sorted], dtype=np.float64)
+    t2 = np.array([row[0] for row in s2_sorted], dtype=np.float64)
+    v2 = np.array([row[1] for row in s2_sorted], dtype=np.float64)
+
+    all_ts = np.union1d(t1, t2)
+
+    f1 = interp1d(t1, v1, kind=method, fill_value=fill_value, bounds_error=False)
+    f2 = interp1d(t2, v2, kind=method, fill_value=fill_value, bounds_error=False)
+
+    new_v1 = f1(all_ts)
+    new_v2 = f2(all_ts)
+
+    s1_aligned = [[int(ts), float(val)] for ts, val in zip(all_ts, new_v1)]
+    s2_aligned = [[int(ts), float(val)] for ts, val in zip(all_ts, new_v2)]
+
+    return s1_aligned, s2_aligned
+
+
+# === analysis/__init__.py ===
+# analysis/__init__.py
+"""
+分析模块，包含单序列和多序列时序数据分析功能
+"""
+from analysis.single_series import analyze_single_series
+from analysis.multi_series import analyze_multi_series
+from analysis.data_alignment import align_series
+
+# === analysis/single_series.py ===
+# analysis/single_series.py
+import config
+import numpy as np
+import logging
+from detectors.base import DetectionResult
+
+logger = logging.getLogger("anomaly_detection.single_series")
+
+def analyze_single_series(series):
+    """
+    对单个时间序列进行异常检测分析
+    
+    参数:
+        series: 时间序列数据 [(timestamp, value), ...]
+        
+    返回:
+        dict: 包含分析结果的字典
+    """
+    if not series:
+        logger.warning("输入时间序列为空")
+        return {
+            "method_results": [],
+            "composite_score": 0,
+            "classification": "正常",
+            "anomaly_times": []
+        }
+        
+    # 检查数据有效性
+    values = [v for _, v in series]
+    if len(set(values)) <= 1:
+        logger.info("输入时间序列几乎不变，无需检测")
+        return {
+            "method_results": [],
+            "composite_score": 0,
+            "classification": "正常",
+            "anomaly_times": []
+        }
+        
+    # 导入检测器
+    from detectors.zscore import ZScoreDetector
+    from detectors.cusum import CUSUMDetector
+    from detectors.stl_detector import STLDetector
+    
+    # 加载阈值配置
+    thres = config.THRESHOLD_CONFIG
+    
+    # 执行异常检测 - Z-Score
+    try:
+        res_z = ZScoreDetector(
+            threshold=thres.get("Z-Score", {}).get("threshold", 3.5)
+        ).detect(series)
+        logger.info(f"Z-Score 检测到 {len(res_z.anomalies)} 个异常点")
+    except Exception as e:
+        logger.error(f"Z-Score 检测失败: {e}")
+        res_z = DetectionResult(method="Z-Score", description=f"检测失败: {e}")
+    
+    # 执行异常检测 - CUSUM
+    try:
+        res_cusum = CUSUMDetector(
+            drift_threshold=thres.get("CUSUM", {}).get("drift_threshold", 6.0),
+            k=thres.get("CUSUM", {}).get("k", 0.7)
+        ).detect(series)
+        logger.info(f"CUSUM 检测到 {len(res_cusum.anomalies)} 个异常点, {len(res_cusum.intervals)} 个异常区间")
+    except Exception as e:
+        logger.error(f"CUSUM 检测失败: {e}")
+        res_cusum = DetectionResult(method="CUSUM", description=f"检测失败: {e}")
+    
+    # 执行异常检测 - STL
+    try:
+        res_stl = STLDetector(
+            seasonal=thres.get("STL", {}).get("seasonal", 24),
+            z_threshold=thres.get("STL", {}).get("z_threshold", 3.5)
+        ).detect(series)
+        logger.info(f"STL 检测到 {len(res_stl.anomalies)} 个异常点")
+    except Exception as e:
+        logger.error(f"STL 检测失败: {e}")
+        res_stl = DetectionResult(method="STL", description=f"检测失败: {e}")
+    
+    # 检查是否所有方法都失败了
+    valid_results = []
+    for result in [res_z, res_cusum, res_stl]:
+        if len(result.anomalies) > 0 or len(result.intervals) > 0 or result.visual_type != "none":
+            valid_results.append(result)
+    
+    if not valid_results:
+        logger.warning("所有检测方法都未找到异常或失败")
+        return {
+            "method_results": [res_z, res_cusum, res_stl],
+            "composite_score": 0,
+            "classification": "正常",
+            "anomaly_times": []
+        }
+    
+    # 避免STL和Z-Score重复计算
+    method_results = []
+    method_names = set()
+    
+    for result in [res_z, res_cusum, res_stl]:
+        # 跳过重复方法
+        if result.method == "STL-Fallback" and "Z-Score" in method_names:
+            logger.info("跳过与Z-Score重复的STL回退结果")
+            continue
+        method_results.append(result)
+        method_names.add(result.method)
+    
+    # 计算综合得分
+    total_weight = 0.0
+    composite_score = 0.0
+    length = len(series)
+    
+    for res in method_results:
+        # 获取方法权重，确保每个方法都有权重值
+        m_name = res.method
+        weight = config.WEIGHTS_SINGLE.get(m_name, 0.3)  # 默认0.3
+        total_weight += weight
+        
+        # 计算异常严重程度
+        anomalies_count = len(res.anomalies)
+        intervals_count = len(res.intervals) * 3  # 区间异常权重更高
+        total_count = anomalies_count + intervals_count
+        
+        if res.visual_type == "none":
+            # 纯文本解释类检测器
+            method_score = 0
+        elif total_count > 0:
+            # 使用对数缩放，避免大数据集中的稀释效应
+            # 调整公式，使得即使异常比例很小，也能得到一定的分数
+            if total_count / length < 0.01:  # 低于1%的异常点
+                method_score = 0.2 + 0.3 * (total_count / length) * 100  # 线性调整
+            else:
+                ratio = total_count / length
+                method_score = min(0.9, 0.2 + 0.3 * np.log10(1 + ratio * 100))
+        else:
+            method_score = 0
+        
+        logger.info(f"方法 {m_name} 得分: {method_score:.2f}, 权重: {weight}")
+        composite_score += weight * method_score
+    
+    if total_weight > 0:
+        composite_score /= total_weight
+    
+    # 添加得分的置信度调整 - 减少误报
+    # 如果只有一个方法检测到异常，降低得分
+    methods_with_anomalies = sum(1 for res in method_results 
+                              if len(res.anomalies) > 0 or len(res.intervals) > 0)
+    if methods_with_anomalies == 1 and len(method_results) > 1:
+        logger.info("仅一个方法检测到异常，降低得分")
+        composite_score *= 0.8  # 降低20%
+    
+    # 确定分类
+    classification = (
+        "高置信度异常" if composite_score >= config.HIGH_ANOMALY_THRESHOLD
+        else "轻度异常" if composite_score >= config.MILD_ANOMALY_THRESHOLD
+        else "正常"
+    )
+    
+    logger.info(f"综合得分: {composite_score:.2f}, 分类: {classification}")
+    
+    # 合并所有异常点
+    all_anomalies = set()
+    for r in method_results:
+        all_anomalies.update(r.anomalies)
+    
+    # 计算异常点占总数据的比例
+    anomaly_ratio = len(all_anomalies) / length if length > 0 else 0
+    # 如果异常点超过25%，可能是误报，重新评估
+    if anomaly_ratio > 0.25:
+        logger.warning(f"异常点比例高达 {anomaly_ratio:.1%}，重新评估分类")
+        # 对于大量异常点，需要多个方法一致确认才算高置信度异常
+        if methods_with_anomalies < len(method_results) * 0.7:  # 少于70%的方法检测到异常
+            if classification == "高置信度异常":
+                classification = "轻度异常"
+                logger.info("降级为轻度异常")
+            elif classification == "轻度异常" and anomaly_ratio > 0.4:
+                classification = "正常"
+                logger.info("降级为正常")
+    
+    return {
+        "method_results": method_results,
+        "composite_score": composite_score,
+        "classification": classification,
+        "anomaly_times": sorted(all_anomalies)
+    }
+
+# === detectors/trend_drift_cusum.py ===
+# detectors/trend_drift_cusum.py
+import numpy as np
+from detectors.base import DetectionResult
+from utils.time_utils import group_anomaly_times
+
+class TrendDriftCUSUMDetector:
+    def __init__(self, threshold: float = 5.0):
+        """
+        初始化趋势漂移检测器
+        
+        参数:
+            threshold: CUSUM阈值，超过此值视为异常
+        """
+        self.threshold = threshold
+    
+    def detect(self, series1: list, series2: list) -> DetectionResult:
+        """
+        检测两个时间序列之间的趋势漂移
+        """
+        if not series1 or not series2 or len(series1) < 10 or len(series2) < 10:
+            return DetectionResult(
+                method="TrendDriftCUSUM",
+                description="数据点不足进行趋势漂移分析(至少需要10个点)",
+                visual_type="none"
+            )
+        
+        # 计算两个序列之间的差异
+        residuals = []
+        timestamps = [t for t, _ in series1]
+        values1 = [v for _, v in series1]
+        values2 = [v for _, v in series2]
+        
+        for (_, v1), (_, v2) in zip(series1, series2):
+            residuals.append(v1 - v2)
+        
+        # 计算基本统计量，用于初步评估差异
+        mean_abs_residual = np.mean(np.abs(residuals))
+        max_abs_residual = np.max(np.abs(residuals))
+        relative_diff = mean_abs_residual / (np.mean(np.abs(values1)) + 1e-10)
+        
+        # 检查整体差异是否足够大
+        if max_abs_residual < 0.05 and mean_abs_residual < 0.01:
+            return DetectionResult(
+                method="TrendDriftCUSUM",
+                description=f"两序列几乎相同，最大差异仅{max_abs_residual:.3f}，平均差异{mean_abs_residual:.3f}",
+                visual_type="none"
+            )
+        
+        # 相对差异小于10%
+        if relative_diff < 0.1:
+            return DetectionResult(
+                method="TrendDriftCUSUM",
+                description=f"两序列差异不显著(相对差异{relative_diff:.1%})，无需进行漂移分析",
+                visual_type="none"
+            )
+        
+        # 计算CUSUM前先对数据进行平滑处理
+        def smooth_data(data, window=3):
+            """简单移动平均平滑"""
+            if len(data) < window:
+                return data
+            smoothed = np.convolve(data, np.ones(window)/window, mode='same')
+            # 边缘处理
+            smoothed[:window//2] = data[:window//2]
+            smoothed[-window//2:] = data[-window//2:]
+            return smoothed
+        
+        # 平滑残差
+        smoothed_residuals = smooth_data(residuals, window=5)
+        
+        # 计算残差的标准差和均值
+        mean = np.mean(smoothed_residuals)
+        std = np.std(smoothed_residuals) 
+        
+        # 防止除零
+        if std < 1e-10:
+            std = 1.0
+            
+        # 标准化残差
+        norm_residuals = [(r - mean) / std for r in smoothed_residuals]
+        
+        # 计算CUSUM，增大控制因子
+        control_factor = 1.0  # 增大控制因子，减少灵敏度
+        cum_sum_pos = [0]
+        cum_sum_neg = [0]
+        
+        # 分别跟踪上升和下降趋势
+        for r in norm_residuals:
+            cum_sum_pos.append(max(0, cum_sum_pos[-1] + r - control_factor))
+            cum_sum_neg.append(max(0, cum_sum_neg[-1] - r - control_factor))
+        
+        cum_sum_pos = cum_sum_pos[1:]  # 移除初始0
+        cum_sum_neg = cum_sum_neg[1:]  # 移除初始0
+        
+        # 取两个方向CUSUM的最大值
+        cum_sum = [max(p, n) for p, n in zip(cum_sum_pos, cum_sum_neg)]
+        
+        # 找出超过阈值的点，但增加持续性要求
+        anomalies = []
+        scores = []
+        consecutive_count = 0
+        required_consecutive = 3  # 至少需要连续3个点超过阈值
+        
+        for i, c in enumerate(cum_sum):
+            if c > self.threshold:
+                consecutive_count += 1
+                if consecutive_count >= required_consecutive:
+                    # 只将第一个连续异常点加入列表
+                    if consecutive_count == required_consecutive:
+                        anomalies.append(timestamps[i - required_consecutive + 1])
+                        scores.append(float(c))
+                    # 将当前点也加入
+                    anomalies.append(timestamps[i])
+                    scores.append(float(c))
+            else:
+                consecutive_count = 0
+        
+        # 分组为区间，要求至少5分钟
+        intervals = group_anomaly_times(anomalies, max_gap=300)  # 5分钟间隔
+        
+        # 过滤短区间和弱区间
+        filtered_intervals = []
+        explanations = []
+        
+        for interval in intervals:
+            start, end = interval
+            duration = end - start
+            
+            # 获取区间内的CUSUM值
+            interval_indices = [i for i, ts in enumerate(timestamps) if start <= ts <= end]
+            if not interval_indices:
+                continue
+                
+            interval_scores = [cum_sum[i] for i in interval_indices]
+            avg_score = np.mean(interval_scores) if interval_scores else 0
+            max_score = np.max(interval_scores) if interval_scores else 0
+                
+            # 过滤条件：区间至少5分钟且平均CUSUM值显著高于阈值
+            # 同时最大值也要显著高于阈值
+            if duration >= 300 and avg_score > self.threshold * 1.3 and max_score > self.threshold * 1.5:
+                filtered_intervals.append(interval)
+                explanations.append(
+                    f"区间{formatted_timestamp(start)}至{formatted_timestamp(end)}的CUSUM值平均为{avg_score:.1f}，最大值{max_score:.1f}，超过阈值{self.threshold}，表明两序列存在持续趋势差异"
+                )
+        
+        # 如果没有异常区间，返回无异常结果
+        if not filtered_intervals:
+            return DetectionResult(
+                method="TrendDriftCUSUM",
+                description=f"趋势漂移检测未发现明显的持续性异常区段",
+                visual_type="none"
+            )
+        
+        # 构建辅助曲线数据
+        aux_curve = [(timestamps[i], float(cum_sum[i])) for i in range(len(timestamps))]
+        
+        return DetectionResult(
+            method="TrendDriftCUSUM",
+            anomalies=[],  # 不使用点异常，只用区间
+            anomaly_scores=[],
+            intervals=filtered_intervals,
+            auxiliary_curve=aux_curve,
+            description=f"趋势漂移检测发现 {len(filtered_intervals)} 个明显异常区段，相对差异{relative_diff:.1%}",
+            visual_type="range",
+            explanation=explanations
+        )
+
+def formatted_timestamp(ts):
+    """将时间戳格式化为可读时间"""
+    from datetime import datetime
+    try:
+        return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+    except:
+        return str(ts)
+
+# === detectors/stl_detector.py ===
+# detectors/stl_detector.py
+import numpy as np
+import traceback
+from typing import List, Tuple, Optional
+from statsmodels.tsa.seasonal import STL
+from detectors.base import DetectionResult
+
+class STLDetector:
+    """
+    使用STL (Season-Trend-Loess) 分解的异常检测器
+    """
+    def __init__(self, seasonal: int = 24, z_threshold: float = 3.0):
+        """
+        初始化STL检测器
+        
+        参数:
+            seasonal: 季节性周期长度，默认为24（假设每小时的数据有天周期）
+            z_threshold: 残差Z-Score阈值
+        """
+        self.seasonal = seasonal
+        self.z_threshold = z_threshold
+    
+    def detect(self, series: List[Tuple[int, float]]) -> DetectionResult:
+        """对时间序列执行STL分解检测"""
+        if not series:
+            return DetectionResult(method="STL", description="无数据进行STL分解", visual_type="none")
+            
+        # 提取时间戳和值
+        timestamps = [t for t, _ in series]
+        values = np.array([v for _, v in series])
+        
+        # 基础验证：检查数据长度
+        if len(values) < 2:
+            print(f"STL 数据点数不足: {len(values)}")
+            return DetectionResult(
+                method="STL", 
+                description="数据点数不足以进行分析",
+                visual_type="none"
+            )
+            
+        # 验证：检查是否存在非法值
+        if np.isnan(values).any() or np.isinf(values).any():
+            # 清理非法值
+            is_valid = ~(np.isnan(values) | np.isinf(values))
+            if np.sum(is_valid) < len(values) * 0.9:  # 如果有效数据不足90%
+                print(f"STL 数据含有过多无效值: {len(values) - np.sum(is_valid)} / {len(values)}")
+                return DetectionResult(
+                    method="STL", 
+                    description="数据含有过多无效值，无法分析",
+                    visual_type="none"
+                )
+            # 替换无效值
+            valid_mean = np.mean(values[is_valid])
+            values_clean = np.copy(values)
+            values_clean[~is_valid] = valid_mean
+            values = values_clean
+        
+        # 验证：几乎不变的数据
+        value_range = np.max(values) - np.min(values)
+        if value_range < 1e-6 or np.std(values) < 1e-6:
+            print("STL 数据几乎不变")
+            return DetectionResult(
+                method="STL", 
+                description="数据几乎不变，无需进行异常检测",
+                visual_type="none"
+            )
+            
+        # 尝试自动确定合适的季节性参数
+        def estimate_seasonality(ts_values, ts_timestamps):
+            """估计时间序列的季节性周期"""
+            try:
+                # 检查采样间隔
+                if len(ts_timestamps) < 2:
+                    return max(2, min(len(ts_values) // 4, 10))
+                    
+                intervals = [ts_timestamps[i+1] - ts_timestamps[i] for i in range(len(ts_timestamps)-1)]
+                if not intervals:
+                    return 2  # 默认最小季节性
+                    
+                median_interval = sorted(intervals)[len(intervals)//2]
+                print(f"数据点的中位数时间间隔: {median_interval} 秒")
+                
+                # 数据量太少，使用默认值
+                if len(ts_values) < 48:
+                    return max(3, min(len(ts_values) // 4, 11))  # 确保是奇数
+                
+                # 常见周期性估计
+                if 3500 <= median_interval <= 3700:  # ~1小时
+                    # 对于小时级数据，根据数据长度估计
+                    if len(ts_values) >= 48:  # 超过2天的数据
+                        return 24  # 一天的周期
+                    else:
+                        return max(3, len(ts_values) // 4)
+                elif 80000 <= median_interval <= 90000:  # ~1天
+                    return 7  # 一周的周期
+                elif 290000 <= median_interval <= 310000:  # ~3-4天
+                    return 4  # 约2周一个周期
+                else:
+                    # 如果有固定模式的峰值（例如每小时定时任务）
+                    # 尝试检测这种模式
+                    try:
+                        # 获取峰值
+                        peaks = []
+                        for i in range(1, len(ts_values)-1):
+                            if ts_values[i] > ts_values[i-1] and ts_values[i] > ts_values[i+1]:
+                                if ts_values[i] > np.mean(ts_values) + 1.5 * np.std(ts_values):
+                                    peaks.append(i)
+                        
+                        if len(peaks) >= 3:
+                            # 计算峰值之间的间隔
+                            peak_intervals = [peaks[i+1] - peaks[i] for i in range(len(peaks)-1)]
+                            if peak_intervals:
+                                avg_interval = sum(peak_intervals) / len(peak_intervals)
+                                print(f"检测到明显的峰值模式，平均间隔: {avg_interval} 个点")
+                                if 10 <= avg_interval <= 20:
+                                    return int(avg_interval)
+                    except Exception as e:
+                        print(f"峰值检测失败: {e}")
+                    
+                    # 使用默认值（奇数）
+                    default_seasonal = max(3, min(len(ts_values) // 8, 23))
+                    # 确保是奇数
+                    if default_seasonal % 2 == 0:
+                        default_seasonal += 1
+                    return default_seasonal
+            except Exception as e:
+                print(f"季节性估计错误: {e}")
+                # 返回奇数值
+                default_val = max(3, min(len(ts_values) // 6, 11))
+                return default_val if default_val % 2 == 1 else default_val + 1
+        
+        try:
+            # 一、尝试使用更适合的季节性参数
+            if self.seasonal < 2 or self.seasonal > len(values) // 2:
+                estimated_seasonal = estimate_seasonality(values, timestamps)
+                print(f"自动估计的季节性参数: {estimated_seasonal}")
+                # 确保季节性参数在合理范围
+                self.seasonal = max(2, min(estimated_seasonal, len(values) // 2))
+                # 确保季节性参数是奇数，以便于简化分析
+                if self.seasonal % 2 == 0:
+                    self.seasonal += 1
+                print(f"最终使用的季节性参数: {self.seasonal}")
+            
+            # 如果数据不足以执行标准STL (至少需要2*seasonal的数据)
+            if len(values) < 2 * self.seasonal:
+                print(f"数据长度({len(values)})不足以进行STL分解(需要至少{2*self.seasonal}点)")
+                # 使用简化季节性分解
+                return self._perform_simplified_analysis(timestamps, values)
+                
+            # 二、尝试不同配置进行STL分解
+            stl_result = None
+            stl_error = None
+            
+            # 尝试的参数组合
+            param_combinations = [
+                # 周期性参数, 鲁棒性, 周期性平滑度
+                (self.seasonal, True, None),
+                (self.seasonal, False, None),
+                (max(2, self.seasonal // 2), True, None),
+                (max(2, self.seasonal // 2), False, None),
+                (max(2, self.seasonal * 2), True, None)
+            ]
+            
+            for seasonal_param, robust_param, seasonal_deg in param_combinations:
+                try:
+                    stl_config = {
+                        'seasonal': seasonal_param,
+                        'robust': robust_param
+                    }
+                    if seasonal_deg is not None:
+                        stl_config['seasonal_deg'] = seasonal_deg
+                        
+                    print(f"尝试STL配置: {stl_config}")
+                    stl = STL(values, **stl_config)
+                    stl_result = stl.fit()
+                    print(f"STL分解成功，使用配置: {stl_config}")
+                    break  # 成功找到可行配置
+                except Exception as e:
+                    stl_error = str(e)
+                    print(f"STL配置 {stl_config} 失败: {e}")
+                    continue
+                    
+            # 如果所有STL配置都失败
+            if stl_result is None:
+                print(f"所有STL配置都失败，最后错误: {stl_error}")
+                return self._perform_simplified_analysis(timestamps, values)
+                
+            # 三、成功执行STL分解，计算残差异常
+            resid = stl_result.resid
+            
+            # 计算残差的Z-Score
+            resid_mean = np.mean(resid)
+            resid_std = np.std(resid) if np.std(resid) > 0 else 1.0
+            resid_z = (resid - resid_mean) / resid_std
+            
+            # 找出残差超过阈值的异常点
+            anomalies = []
+            scores = []
+            explanations = []
+            
+            for i, z in enumerate(resid_z):
+                if abs(z) > self.z_threshold:
+                    anomalies.append(timestamps[i])
+                    scores.append(float(abs(z)))
+                    direction = "高于" if z > 0 else "低于"
+                    explanations.append(f"STL残差Z-Score={z:.2f}，该点{direction}预期值{abs(z):.2f}个标准差")
+            
+            # 构建残差曲线
+            resid_curve = [(timestamps[i], float(resid[i])) for i in range(len(timestamps))]
+            
+            return DetectionResult(
+                method="STL",
+                anomalies=anomalies,
+                anomaly_scores=scores,
+                auxiliary_curve=resid_curve,
+                description=f"STL分解(季节性周期={self.seasonal}) + 残差Z-Score(阈值={self.z_threshold})检测到{len(anomalies)}个异常点",
+                visual_type="point",
+                explanation=explanations
+            )
+            
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"STL分解失败: {e}\n{tb}")
+            return self._perform_simplified_analysis(timestamps, values)
+    
+    def _perform_simplified_analysis(self, timestamps, values):
+        """
+        当STL分解失败时使用简化的分析方法
+        """
+        try:
+            print("使用简化的滑动窗口分析作为替代")
+            # 使用简单的移动平均作为替代方法
+            window_size = max(3, min(self.seasonal, len(values) // 3))
+            # 确保窗口大小是奇数
+            if window_size % 2 == 0:
+                window_size += 1
+            
+            print(f"使用窗口大小: {window_size}")
+            
+            # 使用简单的移动平均作为趋势
+            try:
+                # 首先尝试scipy的medfilt
+                from scipy.signal import medfilt
+                padded_values = np.pad(values, (window_size//2, window_size//2), mode='edge')
+                trend = medfilt(padded_values, kernel_size=window_size)[window_size//2:window_size//2+len(values)]
+            except Exception as e:
+                print(f"中值滤波失败: {e}，使用滑动平均")
+                # 如果失败，使用手动实现的滑动平均
+                trend = np.zeros_like(values)
+                half_window = window_size // 2
+                
+                for i in range(len(values)):
+                    start = max(0, i - half_window)
+                    end = min(len(values), i + half_window + 1)
+                    trend[i] = np.mean(values[start:end])
+            
+            # 计算残差
+            residuals = values - trend
+            
+            # 计算残差Z-Score
+            resid_mean = np.mean(residuals)
+            resid_std = np.std(residuals) if np.std(residuals) > 0 else 1.0
+            resid_z = (residuals - resid_mean) / resid_std
+            
+            # 找出异常点
+            anomalies = []
+            scores = []
+            explanations = []
+            
+            for i, z in enumerate(resid_z):
+                if abs(z) > self.z_threshold:
+                    anomalies.append(timestamps[i])
+                    scores.append(float(abs(z)))
+                    direction = "高于" if z > 0 else "低于"
+                    explanations.append(f"简化残差Z-Score={z:.2f}，该点{direction}趋势{abs(z):.2f}个标准差")
+            
+            # 构建残差曲线
+            resid_curve = [(timestamps[i], float(residuals[i])) for i in range(len(timestamps))]
+            
+            return DetectionResult(
+                method="STL-Simplified",
+                anomalies=anomalies,
+                anomaly_scores=scores,
+                auxiliary_curve=resid_curve,
+                description=f"简化滑动窗口分析(窗口={window_size})检测到{len(anomalies)}个异常点",
+                visual_type="point",
+                explanation=explanations
+            )
+            
+        except Exception as e:
+            print(f"简化分析也失败了: {e}")
+            # 最后的后备方案：使用Z-Score
+            from detectors.zscore import ZScoreDetector
+            zscore_result = ZScoreDetector(threshold=self.z_threshold).detect(list(zip(timestamps, values)))
+            
+            # 确保不重复Z-Score结果
+            zscore_result.method = "STL-Fallback"
+            zscore_result.description = f"STL分解失败，使用Z-Score作为替代方法"
+            
+            return zscore_result
+
+# === detectors/base.py ===
+# detectors/base.py
+from typing import List, Tuple, Optional, Dict, Any, Union
+
+class DetectionResult:
+    """
+    统一的异常检测结果类，支持多种可视化展示方式
+    
+    属性:
+        method: 检测方法名称
+        anomalies: 异常时间点列表
+        anomaly_scores: 对应每个异常点的分数
+        intervals: 异常区间列表 [(start, end), ...]
+        auxiliary_curve: 辅助曲线数据 [(ts, value), ...]
+        description: 检测方法的描述
+        visual_type: 可视化类型 "point"|"range"|"curve"|"none"
+        explanation: 对应每个异常点/区间的解释文本
+    """
+    def __init__(
+        self,
+        method: str,
+        anomalies: Optional[List[int]] = None,
+        anomaly_scores: Optional[List[float]] = None,
+        intervals: Optional[List[Tuple[int, int]]] = None,
+        auxiliary_curve: Optional[List[Tuple[int, float]]] = None,
+        description: str = "",
+        visual_type: str = "point",  # point | range | curve | none
+        explanation: Optional[List[str]] = None,
+    ):
+        self.method = method
+        self.anomalies = anomalies or []
+        self.anomaly_scores = anomaly_scores or []
+        self.intervals = intervals or []
+        self.auxiliary_curve = auxiliary_curve or []
+        self.description = description
+        self.visual_type = visual_type
+        self.explanation = explanation or []
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """将结果转换为字典格式，便于序列化和传输"""
+        return {
+            "method": self.method,
+            "anomalies": self.anomalies,
+            "anomaly_scores": self.anomaly_scores,
+            "intervals": self.intervals,
+            "auxiliary_curve": self.auxiliary_curve,
+            "description": self.description,
+            "visual_type": self.visual_type,
+            "explanation": self.explanation
+        }
+
+# === detectors/residual_comparison.py ===
+import numpy as np
+from detectors.base import DetectionResult
+
+class ResidualComparisonDetector:
+    def __init__(self, threshold: float = 3.0):
+        self.threshold = threshold
+
+    def detect(self, series1: list[tuple[int, float]], series2: list[tuple[int, float]]) -> DetectionResult:
+        residuals = []
+        timestamps = [t for t, _ in series1]
+
+        for (_, v1), (_, v2) in zip(series1, series2):
+            residuals.append(v1 - v2)
+
+        residuals = np.array(residuals)
+        mean = np.mean(residuals)
+        std = np.std(residuals)
+        z_scores = (residuals - mean) / std
+
+        anomalies = []
+        scores = []
+        explanations = []
+
+        for i, z in enumerate(z_scores):
+            if abs(z) > self.threshold:
+                anomalies.append(timestamps[i])
+                scores.append(round(abs(z), 3))
+                explanations.append(f"残差Z值={z:.2f}，两序列差异大")
+
+        return DetectionResult(
+            method="ResidualComparison",
+            anomalies=anomalies,
+            anomaly_scores=scores,
+            description=f"基于残差Z分数检测出 {len(anomalies)} 个异常点（阈值={self.threshold}）",
+            visual_type="point",
+            explanation=explanations
+        )
+
+
+# === detectors/zscore.py ===
+# detectors/zscore.py
+import numpy as np
+from typing import List, Tuple, Optional
+from detectors.base import DetectionResult
+
+class ZScoreDetector:
+    """
+    Z-Score 异常检测器，基于标准差倍数检测异常点
+    """
+    def __init__(self, threshold: float = 3.0):
+        """
+        初始化Z-Score检测器
+        
+        参数:
+            threshold: Z-Score阈值，超过此值视为异常
+        """
+        self.threshold = threshold
+    
+    def detect(self, series: List[Tuple[int, float]]) -> DetectionResult:
+        """
+        对时间序列执行Z-Score检测
+        
+        参数:
+            series: 时间序列数据 [(timestamp, value), ...]
+            
+        返回:
+            DetectionResult: 检测结果对象
+        """
+        if not series:
+            return DetectionResult(
+                method="Z-Score",
+                description="无数据进行Z-Score分析",
+                visual_type="none"
+            )
+        
+        # 提取时间戳和值
+        timestamps = [t for t, _ in series]
+        values = np.array([v for _, v in series])
+        
+        # 计算均值和标准差
+        mean = np.mean(values)
+        std = np.std(values) if len(values) > 1 else 1.0
+        
+        # 计算Z-Score
+        z_scores = (values - mean) / std if std > 0 else np.zeros_like(values)
+        
+        # 找出超过阈值的异常点
+        anomalies = []
+        scores = []
+        explanations = []
+        
+        for i, z in enumerate(z_scores):
+            if abs(z) > self.threshold:
+                anomalies.append(timestamps[i])
+                scores.append(float(abs(z)))
+                # 解释是高于均值还是低于均值
+                direction = "高于" if z > 0 else "低于"
+                explanations.append(f"Z-Score={z:.2f}，{direction}均值{abs(z):.2f}个标准差")
+        
+        return DetectionResult(
+            method="Z-Score",
+            anomalies=anomalies,
+            anomaly_scores=scores,
+            description=f"使用Z-Score方法(阈值={self.threshold})检测到{len(anomalies)}个异常点",
+            visual_type="point",
+            explanation=explanations
+        )
+
+# === detectors/__init__.py ===
+# detectors/__init__.py
+"""
+异常检测器模块，包含各种用于时序数据异常检测的算法
+"""
+
+# 明确导出检测器类以简化导入
+from detectors.zscore import ZScoreDetector
+from detectors.cusum import CUSUMDetector
+from detectors.stl_detector import STLDetector
+from detectors.residual_comparison import ResidualComparisonDetector
+from detectors.trend_drift_cusum import TrendDriftCUSUMDetector
+from detectors.change_rate import ChangeRateDetector
+from detectors.trend_slope import TrendSlopeDetector
+from detectors.base import DetectionResult
+
+# 为向后兼容性导出旧的函数名
+from detectors.zscore import ZScoreDetector as detect_zscore
+from detectors.cusum import CUSUMDetector as detect_cusum
+from detectors.stl_detector import STLDetector as detect_stl_residual
+from detectors.residual_comparison import ResidualComparisonDetector as detect_residual_compare
+from detectors.trend_drift_cusum import TrendDriftCUSUMDetector as detect_trend_drift
+from detectors.change_rate import ChangeRateDetector as detect_change_rate
+from detectors.trend_slope import TrendSlopeDetector as detect_trend_slope
+
+# === detectors/trend_slope.py ===
+# detectors/trend_slope.py
+import numpy as np
+from detectors.base import DetectionResult
+
+class TrendSlopeDetector:
+    def __init__(self, window: int = 5, threshold: float = 0.2, slope_threshold: float = None):
+        """
+        初始化趋势斜率检测器
+        
+        参数:
+            window: 滑动窗口大小
+            threshold: 斜率差异阈值 (与slope_threshold相同，为向后兼容)
+            slope_threshold: 斜率差异阈值（如果提供，优先使用）
+        """
+        self.window = window
+        # 支持两种参数名
+        self.threshold = slope_threshold if slope_threshold is not None else threshold
+    
+    def detect(self, series1: list, series2: list) -> DetectionResult:
+        """
+        检测两个时间序列之间的趋势斜率差异
+        
+        参数:
+            series1: 第一个时间序列 [(timestamp, value), ...]
+            series2: 第二个时间序列 [(timestamp, value), ...]
+            
+        返回:
+            DetectionResult: 检测结果对象
+        """
+        if not series1 or not series2 or len(series1) < self.window or len(series2) < self.window:
+            return DetectionResult(
+                method="TrendSlope",
+                description="数据点不足进行趋势斜率分析",
+                visual_type="none"
+            )
+            
+        def calc_slope(values):
+            x = np.arange(len(values))
+            A = np.vstack([x, np.ones(len(values))]).T
+            m, _ = np.linalg.lstsq(A, values, rcond=None)[0]
+            return m
+
+        slopes1, slopes2, timestamps = [], [], []
+
+        for i in range(len(series1) - self.window + 1):
+            window1 = [v for _, v in series1[i:i + self.window]]
+            window2 = [v for _, v in series2[i:i + self.window]]
+            
+            try:
+                slope1 = calc_slope(window1)
+                slope2 = calc_slope(window2)
+                slopes1.append(slope1)
+                slopes2.append(slope2)
+                timestamps.append(series1[i + self.window // 2][0])
+            except Exception as e:
+                print(f"计算斜率时出错: {e}")
+                continue
+
+        if not timestamps:
+            return DetectionResult(
+                method="TrendSlope",
+                description="无法计算有效的趋势斜率",
+                visual_type="none"
+            )
+
+        slope_diff = np.abs(np.array(slopes1) - np.array(slopes2))
+        sorted_indices = np.argsort(-slope_diff)
+        
+        # 找出差异最大的几个点
+        anomalies = []
+        scores = []
+        explanations = []
+        
+        for i in sorted_indices[:min(3, len(sorted_indices))]:
+            ts = timestamps[i]
+            diff = slope_diff[i]
+            if diff > self.threshold:
+                anomalies.append(ts)
+                scores.append(float(diff))
+                explanations.append(f"趋势斜率差值为 {diff:.3f}，高于阈值 {self.threshold}")
+        
+        return DetectionResult(
+            method="TrendSlope",
+            anomalies=anomalies,
+            anomaly_scores=scores,
+            description=f"TrendSlope 检测两个序列在滑动窗口下的局部趋势方向差异，发现 {len(anomalies)} 个异常点",
+            visual_type="point",
+            explanation=explanations
+        )
+
+# === detectors/change_rate.py ===
+import numpy as np
+from detectors.base import DetectionResult
+
+class ChangeRateDetector:
+    def __init__(self, threshold: float = 0.1):
+        self.threshold = threshold
+
+    def detect(self, series1: list[tuple[int, float]], series2: list[tuple[int, float]]) -> DetectionResult:
+        timestamps = [t for t, _ in series1]
+        rate_diffs = []
+
+        for i in range(1, len(series1)):
+            delta1 = series1[i][1] - series1[i - 1][1]
+            delta2 = series2[i][1] - series2[i - 1][1]
+            rate_diff = abs(delta1 - delta2)
+            rate_diffs.append((timestamps[i], rate_diff))
+
+        # 仅文字解释，找出偏差较大的前几段
+        sorted_diff = sorted(rate_diffs, key=lambda x: -x[1])
+        top = sorted_diff[:3]
+        explanations = [
+            f"{ts}: 变化速率差值为 {round(diff, 3)}，差异较大"
+            for ts, diff in top
+        ]
+
+        return DetectionResult(
+            method="ChangeRate",
+            description="ChangeRate 用于比较两个序列的局部变化速度，检测出速率差异较大的时间点",
+            visual_type="none",
+            explanation=explanations
+        )
+
+
+# === detectors/cusum.py ===
+# detectors/cusum.py
+import numpy as np
+from typing import List, Tuple, Optional
+from detectors.base import DetectionResult
+
+class CUSUMDetector:
+    """
+    CUSUM (累积和) 检测器，用于检测时间序列的累积偏移
+    """
+    def __init__(self, drift_threshold: float = 5.0, k: float = 0.5):
+        """
+        初始化CUSUM检测器
+        
+        参数:
+            drift_threshold: CUSUM阈值，超过此值视为异常
+            k: 灵敏度参数，较小的值对小偏移更敏感
+        """
+        self.drift_threshold = drift_threshold
+        self.k = k
+    
+    def detect(self, series: List[Tuple[int, float]]) -> DetectionResult:
+        """
+        对时间序列执行CUSUM检测
+        
+        参数:
+            series: 时间序列数据 [(timestamp, value), ...]
+            
+        返回:
+            DetectionResult: 检测结果对象
+        """
+        if not series:
+            return DetectionResult(
+                method="CUSUM",
+                description="无数据进行CUSUM分析",
+                visual_type="none"
+            )
+        
+        # 提取时间戳和值
+        timestamps = [t for t, _ in series]
+        values = np.array([v for _, v in series])
+        
+        # 计算数据平均值
+        mean = np.mean(values)
+        std = np.std(values) if len(values) > 1 else 1.0
+        
+        # 初始化CUSUM值
+        cusum_pos = np.zeros(len(values))
+        cusum_neg = np.zeros(len(values))
+        
+        # 计算正负CUSUM
+        for i in range(1, len(values)):
+            # 正向累积
+            cusum_pos[i] = max(0, cusum_pos[i-1] + (values[i] - mean)/std - self.k)
+            # 负向累积
+            cusum_neg[i] = max(0, cusum_neg[i-1] - (values[i] - mean)/std - self.k)
+        
+        # 合并正负CUSUM
+        cusum_combined = np.maximum(cusum_pos, cusum_neg)
+        
+        # 找出超过阈值的异常点
+        anomalies = []
+        scores = []
+        for i, c in enumerate(cusum_combined):
+            if c > self.drift_threshold:
+                anomalies.append(timestamps[i])
+                scores.append(float(c))
+        
+        # 生成解释文本
+        explanations = [
+            f"CUSUM值={scores[i]:.2f}，累计偏移超过阈值({self.drift_threshold})"
+            for i in range(len(anomalies))
+        ]
+        
+        # 构建区间
+        from analysis.multi_series import group_anomaly_times
+        intervals = group_anomaly_times(anomalies)
+        
+        # 构建CUSUM曲线数据
+        cum_curve = [(timestamps[i], float(cusum_combined[i])) for i in range(len(timestamps))]
+        
+        return DetectionResult(
+            method="CUSUM",
+            anomalies=anomalies,
+            anomaly_scores=scores,
+            intervals=intervals,
+            auxiliary_curve=cum_curve,
+            description=f"CUSUM累积偏移检测到 {len(intervals)} 个异常区段，共 {len(anomalies)} 个高偏移点",
+            visual_type="curve",
+            explanation=explanations
+        )
+
+# === storage/database.py ===
+import json
+import config
+try:
+    import pymysql
+except ImportError:
+    pymysql = None
+
+def save_analysis_record(record):
+    """
+    保存分析记录到 MySQL 数据库。
+    record: dict 包含 ip, field, start_time, end_time, methods, anomalies, composite_score, classification, report 等
+    """
+    ip = record.get("ip")
+    field = record.get("field")
+    start = record.get("start_time")
+    end = record.get("end_time")
+    methods = record.get("methods")
+    anomalies = record.get("anomaly_times")
+    composite_score = record.get("composite_score")
+    classification = record.get("classification")
+    report = record.get("report")
+    methods_json = json.dumps(methods, ensure_ascii=False)
+    anomalies_json = json.dumps(anomalies, ensure_ascii=False)
+    insert_sql = (
+        "INSERT INTO anomaly_analysis_records "
+        "(ip, field, start_time, end_time, methods, anomalies, composite_score, classification, report) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    )
+    values = (ip, field, start, end, methods_json, anomalies_json, composite_score, classification, report)
+    try:
+        if pymysql is None:
+            from django.db import connection
+            with connection.cursor() as cursor:
+                cursor.execute(insert_sql, values)
+                connection.commit()
+        else:
+            conn = pymysql.connect(host=config.DB_CONFIG['HOST'],
+                                   port=config.DB_CONFIG['PORT'],
+                                   user=config.DB_CONFIG['USER'],
+                                   password=config.DB_CONFIG['PASSWORD'],
+                                   database=config.DB_CONFIG['NAME'],
+                                   charset='utf8mb4')
+            cursor = conn.cursor()
+            cursor.execute(insert_sql, values)
+            conn.commit()
+            cursor.close()
+            conn.close()
+    except Exception as e:
+        print(f"保存记录失败: {e}")
+
+
