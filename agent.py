@@ -3,7 +3,9 @@ import re
 import json
 import datetime
 import requests
+import time
 import os  
+import traceback
 import hashlib
 import config 
 import dateparser
@@ -12,7 +14,7 @@ from django.conf import settings
 from analysis.single_series import analyze_single_series
 from analysis.multi_series import analyze_multi_series
 from output.report_generator import generate_report_single, generate_report_multi
-from output.visualization import generate_echarts_html_single, generate_echarts_html_multi
+from output.visualization import generate_summary_echarts_html, generate_echarts_html_single, generate_echarts_html_multi
 
 AIOPS_BACKEND_DOMAIN = 'https://aiopsbackend.cstcloud.cn'
 LLM_URL = 'http://10.16.1.16:58000/v1/chat/completions'
@@ -22,7 +24,7 @@ CACHE_DIR = "cached_data"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 def _cache_filename(ip:str, start_ts:int, end_ts:int, field:str)->str:
-    key = f"{ip}_{start_ts}_{end_ts}_{field}"
+    key = f"{ip}_{field}_{start_ts}_{end_ts}"  # 注意字段顺序
     h = hashlib.md5(key.encode('utf-8')).hexdigest()
     return os.path.join(CACHE_DIR, f"{h}.json")
 
@@ -56,26 +58,68 @@ def fetch_data_from_backend(ip:str, start_ts:int, end_ts:int, field:str):
     return arr
 
 def ensure_cache_file(ip:str, start:str, end:str, field:str)->str:
-
+    """
+    确保缓存文件存在，如果不存在则从后端获取
+    
+    参数:
+        ip: 主机IP
+        start: 开始时间 (格式: "YYYY-MM-DD HH:MM:SS")
+        end: 结束时间 (格式: "YYYY-MM-DD HH:MM:SS")
+        field: 指标字段
+        
+    返回:
+        str: 缓存文件路径或错误信息
+    """
     import datetime
     def to_int(s):
-        dt = datetime.datetime.strptime(s,"%Y-%m-%d %H:%M:%S")
-        return int(dt.timestamp())
-    st_i = to_int(start)
-    et_i = to_int(end)
-    fpath= _cache_filename(ip, st_i, et_i, field)
+        try:
+            dt = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+            return int(dt.timestamp())
+        except ValueError as e:
+            # 处理日期无效的情况
+            if "day is out of range for month" in str(e):
+                # 找出有效的日期
+                parts = s.split(" ")[0].split("-")
+                year, month = int(parts[0]), int(parts[1])
+                
+                # 获取该月的最后一天
+                if month == 2:
+                    # 检查是否是闰年
+                    is_leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
+                    last_day = 29 if is_leap else 28
+                elif month in [4, 6, 9, 11]:
+                    last_day = 30
+                else:
+                    last_day = 31
+                
+                # 构造有效日期字符串
+                valid_date = f"{year}-{month:02d}-{last_day:02d} {s.split(' ')[1]}"
+                print(f"日期已自动调整: {s} -> {valid_date}")
+                
+                dt = datetime.datetime.strptime(valid_date, "%Y-%m-%d %H:%M:%S")
+                return int(dt.timestamp())
+            else:
+                # 其他错误直接抛出
+                raise
+    
+    try:
+        st_i = to_int(start)
+        et_i = to_int(end)
+        fpath = _cache_filename(ip, st_i, et_i, field)
 
-    if os.path.exists(fpath):
-        print("(已从本地缓存读取)")
-        return fpath
-    else:
-        data = fetch_data_from_backend(ip, st_i, et_i, field)
-        if isinstance(data, str):
-            return data
-        with open(fpath,"w",encoding="utf-8") as f:
-            json.dump(data,f,ensure_ascii=False,indent=2)
-        print("(已调用后端并写入本地缓存)")
-        return fpath
+        if os.path.exists(fpath):
+            print("(已从本地缓存读取)")
+            return fpath
+        else:
+            data = fetch_data_from_backend(ip, st_i, et_i, field)
+            if isinstance(data, str):
+                return data
+            with open(fpath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print("(已调用后端并写入本地缓存)")
+            return fpath
+    except Exception as e:
+        return f"缓存文件创建失败: {str(e)}"
 
 def load_series_from_cachefile(filepath:str):
     if not os.path.exists(filepath):
@@ -83,7 +127,6 @@ def load_series_from_cachefile(filepath:str):
     with open(filepath,"r",encoding="utf-8") as f:
         arr = json.load(f)
     return arr
-
 
 def parse_time_expressions(raw_text:str):
     segments = re.split(r'[,\uFF0C\u3001\u0026\u002C\u002F\u0020\u0026\u2014\u2013\u2014\u006E\u005E]|和|与|及|还有|、', raw_text)
@@ -99,10 +142,17 @@ def parse_time_expressions(raw_text:str):
         else:
             day_s = datetime.datetime(dt.year, dt.month, dt.day, 0,0,0)
             day_e = datetime.datetime(dt.year, dt.month, dt.day, 23,59,59)
+            
+            # 添加格式化的时间字符串
+            start_str = day_s.strftime("%Y-%m-%d %H:%M:%S")
+            end_str = day_e.strftime("%Y-%m-%d %H:%M:%S")
+            
             results.append({
                 "start": int(day_s.timestamp()),
-                "end":   int(day_e.timestamp()),
-                "error": ""
+                "end": int(day_e.timestamp()),
+                "error": "",
+                "start_str": start_str,
+                "end_str": end_str
             })
     return results
 
@@ -225,9 +275,57 @@ tools = [
             },
             "required": ["ip1","field1","start1","end1","ip2","field2","start2","end2"]
         }
+    },
+     {
+        "name": "生成异常检测图表和报告(TaskPlan版)",
+        "description": "根据用户意图生成的 TaskPlan（分析计划），执行对应的异常检测任务，并生成图表和 HTML 报告。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_plan": {
+                    "type": "object",
+                    "description": "任务计划结构体，包含用户查询、任务类型、时间段、IP、字段等信息。",
+                    "properties": {
+                        "user_query": {"type": "string"},
+                        "output_dir": {"type": "string"},
+                        "tasks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "task_id": {"type": "string"},
+                                    "task_type": {"type": "string", "enum": ["single", "pair", "multivariate"]},
+                                    "field": {"type": "string"},
+                                    "series": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "label": {"type": "string"},
+                                                "ip": {"type": "string"},
+                                                "field": {"type": "string"},
+                                                "start": {"type": "string"},
+                                                "end": {"type": "string"}
+                                            },
+                                            "required": ["ip", "start", "end"]
+                                        }
+                                    },
+                                    "enabled_methods": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    }
+                                },
+                                "required": ["task_id", "task_type", "field", "series"]
+                            }
+                        }
+                    },
+                    "required": ["user_query", "tasks"]
+                }
+            },
+            "required": ["task_plan"]
+        }
     }
 ]
-
 
 def monitor_item_list(ip):
     url = f'{AIOPS_BACKEND_DOMAIN}/api/v1/monitor/mail/machine/field/?instance={ip}'
@@ -291,40 +389,40 @@ def get_monitor_metric_value(ip, start, end, field):
         return data
 
 ###############################################################################
-
 def single_series_detect(ip, field, start, end):
     fpath = ensure_cache_file(ip, start, end, field)
     if isinstance(fpath, str) and not os.path.exists(fpath):
-
         return {"error": fpath}  
-    if isinstance(fpath, str) and os.path.exists(fpath):
+
+    if os.path.exists(fpath):
         series = load_series_from_cachefile(fpath)
         if series is None:
             return {"error": f"无法加载缓存文件: {fpath}"}
 
-        res = analyze_single_series(series)
-        rep = generate_report_single(res, ip, field, start, end, use_deepseek_refine=True)
-        html = generate_echarts_html_single(series, res["anomaly_times"])
-        html_path = f"output/plots/{ip}_{field}_{start[:10]}.html"
-        os.makedirs(os.path.dirname(html_path), exist_ok=True)
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write(html)
-        
-        return {
-            "analysis": res,
-            "report": rep,
-            "html_path": html_path  
-        }
-    else:
-       
-        return {"error": fpath}
+        try:
+            user_query = f"分析 {ip} 在 {start} ~ {end} 的 {field} 数据"
+            result = generate_report_single(series, ip, field, user_query)
+            return result
+        except Exception as e:
+            print(f"单序列分析生成报告失败: {e}")
+            traceback.print_exc()  # 打印详细错误
+            # 通过旧方法返回基本结果
+            analysis_result = analyze_single_series(series)
+            return {
+                "classification": analysis_result["classification"],
+                "composite_score": analysis_result["composite_score"],
+                "anomaly_times": analysis_result["anomaly_times"],
+                "report_path": "N/A - 报告生成失败"
+            }
 
-def multi_series_detect(ip1, field1, start1, end1,
-                        ip2, field2, start2, end2):
+    return {"error": fpath}
+
+def multi_series_detect(ip1, field1, start1, end1, ip2, field2, start2, end2):
     fpath1 = ensure_cache_file(ip1, start1, end1, field1)
+    fpath2 = ensure_cache_file(ip2, start2, end2, field2)
+    
     if isinstance(fpath1, str) and not os.path.exists(fpath1):
         return {"error": fpath1}
-    fpath2 = ensure_cache_file(ip2, start2, end2, field2)
     if isinstance(fpath2, str) and not os.path.exists(fpath2):
         return {"error": fpath2}
 
@@ -333,24 +431,22 @@ def multi_series_detect(ip1, field1, start1, end1,
     if series1 is None or series2 is None:
         return {"error": f"无法加载本地缓存文件: {fpath1} / {fpath2}"}
 
-    res = analyze_multi_series(series1, series2)
-    
-    report = generate_report_multi(res, ip1, field1, ip2, field2,
-                                   start1, end1, start2, end2,
-                                   use_deepseek_refine=True)
-    html = generate_echarts_html_multi(series1, series2, res["anomaly_times"])
-    
-    html_path = f"output/plots/{ip1}_{field1}_{start1[:10]}_vs_{ip2}_{field2}_{start2[:10]}.html"
-    os.makedirs(os.path.dirname(html_path), exist_ok=True)
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
-
-    return {
-        "analysis": res,
-        "report": report,
-        "html_path": html_path
-    }
-
+    try:
+        user_query = f"对比分析 {ip1} 在 {start1} 和 {start2} 的 {field1} 指标"
+        result = generate_report_multi(series1, series2, ip1, ip2, field1, user_query)
+        return result
+    except Exception as e:
+        print(f"多序列分析生成报告失败: {e}")
+        traceback.print_exc()  # 打印详细错误
+        # 通过旧方法返回基本结果
+        analysis_result = analyze_multi_series(series1, series2)
+        return {
+            "classification": analysis_result["classification"],
+            "composite_score": analysis_result["composite_score"],
+            "anomaly_times": analysis_result["anomaly_times"],
+            "anomaly_intervals": analysis_result.get("anomaly_intervals", []),
+            "report_path": "N/A - 报告生成失败"
+        }
 
 ###############################################################################
 
@@ -394,23 +490,83 @@ def parse_llm_response(txt):
     }
 
 def react(llm_text):
-    parsed= parse_llm_response(llm_text)
-    action= parsed["action"]
-    inp_str= parsed["action_input"]
-    final_ans= parsed["final_answer"]
+    parsed = parse_llm_response(llm_text)
+    action = parsed["action"]
+    inp_str = parsed["action_input"]
+    final_ans = parsed["final_answer"]
     supplement = parsed["supplement"]
-    is_final= False
-
-    if supplement.strip():
-        return {"type": "supplement", "content": supplement}
+    is_final = False
 
     if action and inp_str:
         try:
             action_input = json.loads(inp_str)
+        
+        # 检查是否存在时间占位符
+            for key in ["start", "end"]:
+                if key in action_input and isinstance(action_input[key], str):
+                    value = action_input[key]
+                # 检测占位符文本
+                    if "解析结果" in value or "待定" in value:
+                    # 提示用户指定时间
+                        return f"请提供具体的{key}时间（格式：YYYY-MM-DD HH:MM:SS）", False
         except:
             return f"无法解析调用参数JSON: {inp_str}", False
 
-        if action == "解析用户自然语言时间":
+        # 检查IP是否为待定或空
+        if action in ["单序列异常检测(文件)", "多序列对比异常检测(文件)"]:
+            if action_input.get("ip", "") in ["待定", ""]:
+                return "请提供要分析的具体IP地址", False
+            
+            # 对于多序列分析，同时检查第二个IP
+            if action == "多序列对比异常检测(文件)" and action_input.get("ip2", "") in ["待定", ""]:
+                return "请提供第二个要分析的具体IP地址", False
+
+        if action == "单序列异常检测(文件)":
+            result = single_series_detect(**action_input)
+            if "error" in result:
+                return result["error"], False
+
+            rep = result
+            # 添加文字分析报告
+            analysis_text = rep.get("analysis_text", "")
+    
+            final_answer = f"""
+## 单序列异常检测报告
+
+**结论**：{rep['classification']}  
+**得分**：{rep['composite_score']:.2f}  
+**异常点数**：{len(rep['anomaly_times'])}
+
+{analysis_text}
+
+**图表路径**：{rep['report_path']}
+"""
+            return final_answer, False
+
+        elif action == "多序列对比异常检测(文件)":
+            result = multi_series_detect(**action_input)
+            if "error" in result:
+                return result["error"], False
+
+            rep = result
+            # 添加文字分析报告到返回结果
+            analysis_text = rep.get("analysis_text", "")
+    
+            final_answer = f"""
+## 多序列对比异常检测报告
+
+**结论**：{rep['classification']}  
+**综合得分**：{rep['composite_score']:.2f}  
+**异常段数**：{len(rep.get('anomaly_intervals', []))}
+
+{analysis_text}
+
+**图表路径**：{rep['report_path']}
+"""
+            return final_answer, False
+
+        # 其他 action 保持不变
+        elif action == "解析用户自然语言时间":
             return parse_time_expressions(action_input["raw_text"]), False
         elif action == "请求智能运管后端Api，获取指标项的时序数据":
             return get_monitor_metric_value(**action_input), False
@@ -420,30 +576,48 @@ def react(llm_text):
             return get_service_asset(action_input["service"]), False
         elif action == "请求智能运管后端Api，查询监控实例之间的拓扑关联关系":
             return get_service_asset_edges(action_input["service"], action_input["instance_ip"]), False
-
-        elif action == "单序列异常检测(文件)":
-            return single_series_detect(**action_input), False
-
-        elif action == "多序列对比异常检测(文件)":
-            result = multi_series_detect(**action_input)
-            if isinstance(result, dict) and "error" in result:
-                return result["error"], False
-
-            final_answer = result["report"] + f"\n\n 图表已保存到：{result['html_path']}"
-            return final_answer, False
         else:
             return f"未知工具调用: {action}", False
+        
+    if supplement.strip():
+        return {"type": "supplement", "content": supplement}
 
     if final_ans.strip():
         is_final = True
-        return (final_ans,is_final)
+        return final_ans, is_final
 
     return ("格式不符合要求，必须使用：<思考过程></思考过程> <工具调用></工具调用> <调用参数></调用参数> <最终答案></最终答案>", is_final)
 
 def shorten_tool_result(res):
-
     if isinstance(res, list):
+        # 特殊处理时间解析结果
+        if len(res) > 0 and isinstance(res[0], dict) and "start" in res[0] and "end" in res[0]:
+            # 添加格式化的时间字符串
+            for item in res:
+                if "error" not in item or not item["error"]:
+                    # 如果不存在start_str和end_str，添加它们
+                    if "start_str" not in item:
+                        start_dt = datetime.datetime.fromtimestamp(item["start"])
+                        item["start_str"] = start_dt.strftime("%Y-%m-%d %H:%M:%S") 
+                    if "end_str" not in item:
+                        end_dt = datetime.datetime.fromtimestamp(item["end"])
+                        item["end_str"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # 生成一个更易读的摘要
+            time_results = []
+            for item in res:
+                if "error" in item and item["error"]:
+                    time_results.append({"error": item["error"]})
+                else:
+                    time_results.append({
+                        "start_time": item.get("start_str", ""),
+                        "end_time": item.get("end_str", ""),
+                        "start": item.get("start", 0),
+                        "end": item.get("end", 0)
+                    })
+            return json.dumps(time_results, ensure_ascii=False)
         return f"[List len={len(res)}]"
+    # 其他类型的响应保持不变
     elif isinstance(res, dict):
         summary = {}
         for k,v in res.items():
@@ -467,7 +641,7 @@ def chat(user_query):
     当前时间为: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
     处理规则：
-    1.请根据当前时间来推断用户输入的时间区间的具体值
+    1.请根据当前时间来推断用户输入的时间区间的具体值。当你解析时间表达式后，请使用start_str和end_str字段中的具体时间值作为后续调用的时间参数，避免使用"解析结果中的start时间"这样的占位符。
     2.如 parse_time_expressions 只返回1个时间区间，则调用'单序列异常检测(文件)'。
     3.如 parse_time_expressions 返回2个时间区间，并且用户输入包含"对比"、"相比"、"比较"、"环比"、"VS"、"vs"、"变化"、"相较于"等明显比较词汇，则调用'多序列对比异常检测(文件)'。
     4.若parse_time_expressions 返回超过1个时间区间，但是没有明显的比较词汇，可先在<补充请求>里提问，示例:

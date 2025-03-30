@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>异常检测报告</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { padding: 20px; }
+        .iframe-container { width: 100%; height: 650px; border: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="mt-4 mb-4">时序数据异常检测报告</h1>
+        
+        <div class="card mb-4">
+            <div class="card-header">
+                <strong>用户问题</strong>
+            </div>
+            <div class="card-body">
+                <p>分析 192.168.0.110 在 2025-03-28 00:00:00 ~ 2025-03-28 23:59:59 的 cpu_rate 数据</p>
+            </div>
+        </div>
+        
+        <div class="card mb-4">
+            <div class="card-header">
+                <strong>分析结论</strong>
+            </div>
+            <div class="card-body">
+                <div class="alert alert-warning">
+                    <h4>综合判定: 轻度异常</h4>
+                    <p>综合得分: 0.42</p>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card mb-4">
+            <div class="card-header">
+                <strong>异常检测图表</strong>
+            </div>
+            <div class="card-body p-0">
+                <iframe class="iframe-container" src="summary.html"></iframe>
+            </div>
+        </div>
+        
+        <h2 class="mt-4 mb-3">异常点详细说明</h2>
+        
+            <div class="card mb-2">
+                <div class="card-header">
+                    <strong>异常点 #1</strong> - 2025-03-28 09:20:00
+                </div>
+                <div class="card-body">
+                    <p><strong>方法:</strong> Z-Score</p>
+                    <p><strong>值:</strong> 2.14</p>
+                    <p><strong>说明:</strong> Z-Score=3.05，高于均值3.05个标准差</p>
+                </div>
+            </div>
+            
+            <div class="card mb-2">
+                <div class="card-header">
+                    <strong>异常点 #2</strong> - 2025-03-28 11:20:00
+                </div>
+                <div class="card-body">
+                    <p><strong>方法:</strong> Z-Score</p>
+                    <p><strong>值:</strong> 2.13</p>
+                    <p><strong>说明:</strong> Z-Score=3.03，高于均值3.03个标准差</p>
+                </div>
+            </div>
+            
+            <div class="card mb-2">
+                <div class="card-header">
+                    <strong>异常点 #3</strong> - 2025-03-28 12:15:00
+                </div>
+                <div class="card-body">
+                    <p><strong>方法:</strong> Z-Score</p>
+                    <p><strong>值:</strong> 2.94</p>
+                    <p><strong>说明:</strong> Z-Score=4.59，高于均值4.59个标准差</p>
+                </div>
+            </div>
+            
+            <div class="card mb-2">
+                <div class="card-header">
+                    <strong>异常点 #4</strong> - 2025-03-28 15:20:00
+                </div>
+                <div class="card-body">
+                    <p><strong>方法:</strong> Z-Score</p>
+                    <p><strong>值:</strong> 2.12</p>
+                    <p><strong>说明:</strong> Z-Score=3.01，高于均值3.01个标准差</p>
+                </div>
+            </div>
+            
+            <div class="card mb-2">
+                <div class="card-header">
+                    <strong>异常点 #5</strong> - 2025-03-28 16:20:00
+                </div>
+                <div class="card-body">
+                    <p><strong>方法:</strong> Z-Score</p>
+                    <p><strong>值:</strong> 2.14</p>
+                    <p><strong>说明:</strong> Z-Score=3.05，高于均值3.05个标准差</p>
+                </div>
+            </div>
+            
+            <div class="card mb-2">
+                <div class="card-header">
+                    <strong>异常点 #6</strong> - 2025-03-28 18:20:00
+                </div>
+                <div class="card-body">
+                    <p><strong>方法:</strong> Z-Score</p>
+                    <p><strong>值:</strong> 2.13</p>
+                    <p><strong>说明:</strong> Z-Score=3.03，高于均值3.03个标准差</p>
+                </div>
+            </div>
+            
+            <div class="card mb-2">
+                <div class="card-header">
+                    <strong>异常点 #7</strong> - 2025-03-28 22:20:00
+                </div>
+                <div class="card-body">
+                    <p><strong>方法:</strong> Z-Score</p>
+                    <p><strong>值:</strong> 2.13</p>
+                    <p><strong>说明:</strong> Z-Score=3.03，高于均值3.03个标准差</p>
+                </div>
+            </div>
+            
+            <div class="card mb-2">
+                <div class="card-header">
+                    <strong>异常区间 #8</strong> - 2025-03-28 12:15:00 至 2025-03-28 12:40:00
+                </div>
+                <div class="card-body">
+                    <p><strong>方法:</strong> CUSUM</p>
+                    <p><strong>说明:</strong> CUSUM值=6.16，累计偏移超过阈值(5.0)</p>
+                </div>
+            </div>
+            
+        
+        <h2 class="mt-4 mb-3">检测方法摘要</h2>
+        
+        <div class="card mb-2">
+            <div class="card-header">
+                <strong>Z-Score</strong>
+            </div>
+            <div class="card-body">
+                <p>使用Z-Score方法(阈值=3.0)检测到7个异常点</p>
+            </div>
+        </div>
+        
+        <div class="card mb-2">
+            <div class="card-header">
+                <strong>CUSUM</strong>
+            </div>
+            <div class="card-body">
+                <p>CUSUM累积偏移检测到 1 个异常区段，共 6 个高偏移点</p>
+            </div>
+        </div>
+        
+        <div class="card mb-2">
+            <div class="card-header">
+                <strong>STL</strong>
+            </div>
+            <div class="card-body">
+                <p>STL分解失败: Unable to determine period from endog</p>
+            </div>
+        </div>
+        
+        
+        <footer class="mt-5 text-center text-muted">
+            <p>生成时间: 2025-03-29 23:03:00</p>
+        </footer>
+    </div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+{
+  "Z-Score": {
+    "threshold": 3.5
+  },
+  "CUSUM": {
+    "drift_threshold": 6.0,
+    "k": 0.7
+  },
+  "STL": {
+    "seasonal": 24,
+    "z_threshold": 3.5
+  },
+  "STL-Simplified": {
+    "z_threshold": 3.5
+  },
+  "STL-Fallback": {
+    "threshold": 3.5
+  },
+  "ResidualComparison": {
+    "threshold": 3.5
+  },
+  "TrendDriftCUSUM": {
+    "drift_threshold": 8.0
+  },
+  "ChangeRate": {
+    "threshold": 0.7
+  },
+  "TrendSlope": {
+    "slope_threshold": 0.4,
+    "window": 5
+  }
+}
