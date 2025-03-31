@@ -1,32 +1,29 @@
+
 {
   "Z-Score": {
-    "threshold": 3.5
+    "threshold": 3.5,
+    "description": "Z-Score阈值，表示偏离均值多少个标准差视为异常"
   },
   "CUSUM": {
-    "drift_threshold": 6.0,
-    "k": 0.7
-  },
-  "STL": {
-    "seasonal": 24,
-    "z_threshold": 3.5
-  },
-  "STL-Simplified": {
-    "z_threshold": 3.5
-  },
-  "STL-Fallback": {
-    "threshold": 3.5
+    "drift_threshold": 5.0,
+    "k": 0.6,
+    "description": "CUSUM累积和阈值及灵敏度参数k，k越小对小漂移越敏感"
   },
   "ResidualComparison": {
-    "threshold": 3.5
+    "threshold": 3.5,
+    "description": "两序列残差Z-Score阈值，超过此值视为异常"
   },
   "TrendDriftCUSUM": {
-    "drift_threshold": 8.0
+    "drift_threshold": 8.0,
+    "description": "两序列趋势差异累积和阈值，越大越严格"
   },
   "ChangeRate": {
-    "threshold": 0.7
+    "threshold": 0.6,
+    "description": "两序列变化速率差异阈值，越小越敏感"
   },
   "TrendSlope": {
     "slope_threshold": 0.4,
-    "window": 5
+    "window": 5,
+    "description": "趋势斜率差异阈值和滑动窗口大小"
   }
 }

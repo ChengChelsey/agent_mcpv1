@@ -44,7 +44,9 @@ from output.report_generator import get_anomaly_detection_report
 from analysis.single_series import analyze_single_series
 from analysis.multi_series import analyze_multi_series
 from output.report_generator import generate_report_single, generate_report_multi
-from output.visualization import generate_summary_echarts_html, generate_echarts_html_single, generate_echarts_html_multi
+from output.visualization import generate_summary_echarts_html
+from utils.ts_cache import ensure_cache_file, load_series_from_cache
+from utils.time_utils import parse_time_expressions
 
 AIOPS_BACKEND_DOMAIN = 'https://aiopsbackend.cstcloud.cn'
 LLM_URL = 'http://10.16.1.16:58000/v1/chat/completions'
@@ -52,23 +54,6 @@ AUTH = ('chelseyyycheng@outlook.com', 'UofV1uwHwhVp9tcTue')
 
 CACHE_DIR = "cached_data"
 os.makedirs(CACHE_DIR, exist_ok=True)
-
-def _cache_filename(ip:str, start_ts:int, end_ts:int, field:str)->str:
-    """
-    生成缓存文件名（注意此函数的参数顺序必须保持不变）
-    
-    参数:
-        ip: 主机IP
-        start_ts: 开始时间戳
-        end_ts: 结束时间戳
-        field: 指标字段
-        
-    返回:
-        str: 缓存文件路径
-    """
-    key = f"{ip}_{field}_{start_ts}_{end_ts}"  # 注意字段顺序
-    h = hashlib.md5(key.encode('utf-8')).hexdigest()
-    return os.path.join(CACHE_DIR, f"{h}.json")
 
 def fetch_data_from_backend(ip:str, start_ts:int, end_ts:int, field:str):
     url = f"{AIOPS_BACKEND_DOMAIN}/api/v1/monitor/mail/metric/format-value/?start={start_ts}&end={end_ts}&instance={ip}&field={field}"
@@ -98,105 +83,6 @@ def fetch_data_from_backend(ip:str, start_ts:int, end_ts:int, field:str):
                 v = 0.0
             arr.append([t,v])
     return arr
-
-def ensure_cache_file(ip:str, start:str, end:str, field:str)->str:
-    """
-    确保缓存文件存在，如果不存在则从后端获取
-    
-    参数:
-        ip: 主机IP
-        start: 开始时间 (格式: "YYYY-MM-DD HH:MM:SS")
-        end: 结束时间 (格式: "YYYY-MM-DD HH:MM:SS")
-        field: 指标字段
-        
-    返回:
-        str: 缓存文件路径或错误信息
-    """
-    import datetime
-    def to_int(s):
-        try:
-            dt = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-            return int(dt.timestamp())
-        except ValueError as e:
-            # 处理日期无效的情况
-            if "day is out of range for month" in str(e):
-                # 找出有效的日期
-                parts = s.split(" ")[0].split("-")
-                year, month = int(parts[0]), int(parts[1])
-                
-                # 获取该月的最后一天
-                if month == 2:
-                    # 检查是否是闰年
-                    is_leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
-                    last_day = 29 if is_leap else 28
-                elif month in [4, 6, 9, 11]:
-                    last_day = 30
-                else:
-                    last_day = 31
-                
-                # 构造有效日期字符串
-                valid_date = f"{year}-{month:02d}-{last_day:02d} {s.split(' ')[1]}"
-                print(f"日期已自动调整: {s} -> {valid_date}")
-                
-                dt = datetime.datetime.strptime(valid_date, "%Y-%m-%d %H:%M:%S")
-                return int(dt.timestamp())
-            else:
-                # 其他错误直接抛出
-                raise
-    
-    try:
-        st_i = to_int(start)
-        et_i = to_int(end)
-        fpath = _cache_filename(ip, st_i, et_i, field)
-
-        if os.path.exists(fpath):
-            print("(已从本地缓存读取)")
-            return fpath
-        else:
-            data = fetch_data_from_backend(ip, st_i, et_i, field)
-            if isinstance(data, str):
-                return data
-            with open(fpath, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            print("(已调用后端并写入本地缓存)")
-            return fpath
-    except Exception as e:
-        return f"缓存文件创建失败: {str(e)}"
-
-def load_series_from_cachefile(filepath:str):
-    if not os.path.exists(filepath):
-        return None
-    with open(filepath,"r",encoding="utf-8") as f:
-        arr = json.load(f)
-    return arr
-
-def parse_time_expressions(raw_text:str):
-    segments = re.split(r'[,\uFF0C\u3001\u0026\u002C\u002F\u0020\u0026\u2014\u2013\u2014\u006E\u005E]|和|与|及|还有|、', raw_text)
-    results = []
-    for seg in segments:
-        seg = seg.strip()
-        if not seg:
-            continue
-
-        dt = dateparser.parse(seg, languages=['zh','en'], settings={"PREFER_DATES_FROM":"past"})
-        if dt is None:
-            results.append({"start":0, "end":0, "error":f"无法解析: {seg}"})
-        else:
-            day_s = datetime.datetime(dt.year, dt.month, dt.day, 0,0,0)
-            day_e = datetime.datetime(dt.year, dt.month, dt.day, 23,59,59)
-            
-            # 添加格式化的时间字符串
-            start_str = day_s.strftime("%Y-%m-%d %H:%M:%S")
-            end_str = day_e.strftime("%Y-%m-%d %H:%M:%S")
-            
-            results.append({
-                "start": int(day_s.timestamp()),
-                "end": int(day_e.timestamp()),
-                "error": "",
-                "start_str": start_str,
-                "end_str": end_str
-            })
-    return results
 
 tools = [
      {
@@ -361,36 +247,21 @@ def get_service_asset_edges(service, instance_ip):
         return f"查询拓扑失败: {resp.status_code} => {resp.text}"
     
 def get_series_data(ip: str, start: str, end: str, field: str):
-    """
-    封装数据拉取流程：缓存检查 + 加载数据
-    返回值: list 或 str（错误信息）
-    """
-    fpath = ensure_cache_file(ip, start, end, field)
-    if isinstance(fpath, str) and not os.path.exists(fpath):
-        return fpath  # 返回错误字符串
-    return load_series_from_cachefile(fpath)
+    try:
+        return load_series_from_cache(ip, field, start, end)
+    except Exception as e:
+        return str(e) 
 
 def validate_multi_series_params(action_input):
-    """
-    验证多序列对比异常检测的参数
-    
-    参数:
-        action_input: 动作输入参数
-        
-    返回:
-        bool: 参数是否有效
-    """
-    # 识别序列编号
+    #验证多序列对比异常检测的参数，目前只能处理两个序列的对比
+
     sequence_nums = set()
     for key in action_input.keys():
         if key.startswith(('ip', 'field', 'start', 'end')) and len(key) > 2 and key[2:].isdigit():
             sequence_nums.add(int(key[2:]))
     
-    # 检查序列数量
     if len(sequence_nums) > 2 or max(sequence_nums, default=0) > 2:
         return False
-    
-    # 检查必要参数
     required_pairs = [
         ('ip1', 'field1', 'start1', 'end1'),
         ('ip2', 'field2', 'start2', 'end2')
@@ -399,91 +270,43 @@ def validate_multi_series_params(action_input):
     for pair in required_pairs:
         if not all(param in action_input for param in pair):
             return False
-            
     return True
 
 ###############################################################################
 def single_series_detect(ip, field, start, end, user_query=""):
-    """
-    进行单序列异常检测
-    
-    参数:
-        ip: 主机IP
-        field: 指标字段
-        start: 开始时间
-        end: 结束时间
-        user_query: 用户原始查询
+
+    try:
+        series = load_series_from_cache(ip, field, start, end)
+        query_text = user_query or f"分析 {ip} 在 {start} ~ {end} 的 {field} 数据"
         
-    返回:
-        dict: 分析结果
-    """
-    # 确保缓存文件存在
-    fpath = ensure_cache_file(ip, start, end, field)
-    if isinstance(fpath, str) and not os.path.exists(fpath):
-        return {"error": fpath}  
-
-    # 加载时序数据
-    if os.path.exists(fpath):
-        series = load_series_from_cachefile(fpath)
-        if series is None:
-            return {"error": f"无法加载缓存文件: {fpath}"}
-
+        result = generate_report_single(series, ip, field, query_text)
+        result["user_query"] = query_text
+        return result
+    except Exception as e:
+        print(f"单序列分析生成报告失败: {e}")
+        traceback.print_exc()
+        
+        #基本分析作为备选
         try:
-            # 设置默认用户查询文本
-            query_text = user_query or f"分析 {ip} 在 {start} ~ {end} 的 {field} 数据"
-            
-            # 生成报告
-            result = generate_report_single(series, ip, field, query_text)
-            result["user_query"] = query_text
-            return result
-        except Exception as e:
-            print(f"单序列分析生成报告失败: {e}")
-            traceback.print_exc()
-            
-            # 使用基本分析作为备选
+            series = load_series_from_cache(ip, field, start, end)
             analysis_result = analyze_single_series(series)
             return {
                 "classification": analysis_result["classification"],
                 "composite_score": analysis_result["composite_score"],
                 "anomaly_times": analysis_result["anomaly_times"],
                 "report_path": "N/A - 报告生成失败",
-                "user_query": query_text
+                "user_query": user_query or f"分析 {ip} 在 {start} ~ {end} 的 {field} 数据"
             }
-
-    return {"error": fpath}
+        except:
+            return {"error": f"无法加载或处理数据: {str(e)}"}
 
 def multi_series_detect(ip1, field1, start1, end1, ip2, field2, start2, end2, user_query=""):
-    """
-    进行多序列对比异常检测
-    
-    参数:
-        ip1, field1, start1, end1: 第一个序列的参数
-        ip2, field2, start2, end2: 第二个序列的参数
-        user_query: 用户原始查询
-        
-    返回:
-        dict: 分析结果
-    """
-    # 确保两个时序数据的缓存文件存在
-    fpath1 = ensure_cache_file(ip1, start1, end1, field1)
-    fpath2 = ensure_cache_file(ip2, start2, end2, field2)
-    
-    if isinstance(fpath1, str) and not os.path.exists(fpath1):
-        return {"error": fpath1}
-    if isinstance(fpath2, str) and not os.path.exists(fpath2):
-        return {"error": fpath2}
-
-    # 加载时序数据
-    series1 = load_series_from_cachefile(fpath1)
-    series2 = load_series_from_cachefile(fpath2)
-    if series1 is None or series2 is None:
-        return {"error": f"无法加载本地缓存文件: {fpath1} / {fpath2}"}
-
     try:
-        # 设置默认用户查询文本
-        query_text = user_query or f"对比分析 {ip1} 在 {start1} 和 {start2} 的 {field1} 指标"
+        series1 = load_series_from_cache(ip1, field1, start1, end1)
+        series2 = load_series_from_cache(ip2, field2, start2, end2)
         
-        # 生成多序列对比报告
+        query_text = user_query or f"对比分析 {ip1} 在 {start1} 和 {ip2} 在 {start2} 的 {field1}/{field2} 指标"
+
         result = generate_report_multi(series1, series2, ip1, ip2, field1, query_text)
         result["user_query"] = query_text
         return result
@@ -491,16 +314,20 @@ def multi_series_detect(ip1, field1, start1, end1, ip2, field2, start2, end2, us
         print(f"多序列分析生成报告失败: {e}")
         traceback.print_exc()
         
-        # 使用基本分析作为备选
-        analysis_result = analyze_multi_series(series1, series2)
-        return {
-            "classification": analysis_result["classification"],
-            "composite_score": analysis_result["composite_score"],
-            "anomaly_times": analysis_result["anomaly_times"],
-            "anomaly_intervals": analysis_result.get("anomaly_intervals", []),
-            "report_path": "N/A - 报告生成失败",
-            "user_query": query_text
-        }
+        try:
+            series1 = load_series_from_cache(ip1, field1, start1, end1)
+            series2 = load_series_from_cache(ip2, field2, start2, end2)
+            analysis_result = analyze_multi_series(series1, series2)
+            return {
+                "classification": analysis_result["classification"],
+                "composite_score": analysis_result["composite_score"],
+                "anomaly_times": analysis_result["anomaly_times"],
+                "anomaly_intervals": analysis_result.get("anomaly_intervals", []),
+                "report_path": "N/A - 报告生成失败",
+                "user_query": query_text
+            }
+        except:
+            return {"error": f"无法加载或处理数据: {str(e)}"}
 
 ###############################################################################
 
@@ -553,7 +380,6 @@ def react(llm_text):
         except:
             return f"无法解析调用参数JSON: {inp_str}", False
 
-        # 其他 action 保持不变
         if action == "解析用户自然语言时间":
             return parse_time_expressions(action_input["raw_text"]), False
         if action == "请求智能运管后端Api，获取指标项的时序数据":
@@ -567,25 +393,19 @@ def react(llm_text):
             return get_service_asset_edges(action_input["service"], action_input["instance_ip"]), False
         
         elif action == "单序列异常检测(文件)":
-            # 调用单序列异常检测函数
             result = single_series_detect(**action_input)
             if "error" in result:
                 return result["error"], False
 
-            # 处理结果并生成报告
             report = get_anomaly_detection_report(result, "single")
             return report, False
         elif action == "多序列对比异常检测(文件)":
-            # 参数验证
             if not validate_multi_series_params(action_input):
                 return "参数验证失败，请确保提供了两组完整的序列信息", False
-                
-            # 调用多序列异常检测函数
             result = multi_series_detect(**action_input)
             if "error" in result:
                 return result["error"], False
 
-            # 处理结果并生成报告
             report = get_anomaly_detection_report(result, "multi")
             return report, False
         else:
@@ -597,17 +417,13 @@ def react(llm_text):
     if final_ans.strip():
         is_final = True
         return final_ans, is_final
-
     return ("格式不符合要求，必须使用：<思考过程></思考过程> <工具调用></工具调用> <调用参数></调用参数> <最终答案></最终答案>", is_final)
 
 def shorten_tool_result(res):
     if isinstance(res, list):
-        # 特殊处理时间解析结果
         if len(res) > 0 and isinstance(res[0], dict) and "start" in res[0] and "end" in res[0]:
-            # 添加格式化的时间字符串
             for item in res:
                 if "error" not in item or not item["error"]:
-                    # 如果不存在start_str和end_str，添加它们
                     if "start_str" not in item:
                         start_dt = datetime.datetime.fromtimestamp(item["start"])
                         item["start_str"] = start_dt.strftime("%Y-%m-%d %H:%M:%S") 
@@ -615,7 +431,7 @@ def shorten_tool_result(res):
                         end_dt = datetime.datetime.fromtimestamp(item["end"])
                         item["end_str"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
             
-            # 生成一个更易读的摘要
+            #一个简单的的摘要
             time_results = []
             for item in res:
                 if "error" in item and item["error"]:
@@ -629,7 +445,6 @@ def shorten_tool_result(res):
                     })
             return json.dumps(time_results, ensure_ascii=False)
         return f"[List len={len(res)}]"
-    # 其他类型的响应保持不变
     elif isinstance(res, dict):
         summary = {}
         for k,v in res.items():
@@ -684,7 +499,7 @@ def chat(user_query):
     max_round=15
     pending_context = None 
     had_supplement = False
-    # 保存原始用户查询，用于生成报告
+    # 记录原始用户查询
     original_user_query = user_query
 
     while True:
@@ -708,7 +523,13 @@ def chat(user_query):
 
         if isinstance(res, dict) and res.get("type") == "supplement":
             print(f"\n小助手: {res['content']}")
-            user_input = input("你: ")
+            try:
+                user_input = input("你: ")
+                if not user_input.strip():
+                    user_input = "默认继续单序列分析"
+            except Exception as e:
+                print(f"无法获取用户输入: {e}")
+                user_input = "默认继续单序列分析"
             
             supplement_response = f"对于您的问题 '{res['content']}'，我的回答是: {user_input}"
             history.append({"role": "user", "content": supplement_response})
@@ -719,24 +540,18 @@ def chat(user_query):
 
         result, done = res
         
-        # 为异常检测工具调用添加原始用户查询
         if any(action in txt for action in ["单序列异常检测(文件)", "多序列对比异常检测(文件)"]):
-            # 从文本中提取action_input
             try:
                 action_input_match = re.search(r'<调用参数>(.*?)</调用参数>', txt, re.DOTALL)
                 if action_input_match:
                     action_input = json.loads(action_input_match.group(1))
-                    # 添加用户查询
                     action_input["user_query"] = original_user_query
-                    # 更新调用参数
                     updated_txt = re.sub(r'<调用参数>.*?</调用参数>', 
                                          f'<调用参数>{json.dumps(action_input, ensure_ascii=False)}</调用参数>', 
                                          txt, flags=re.DOTALL)
-                    # 更新历史记录中的最后一条消息
                     history[-1]["content"] = updated_txt
             except Exception as e:
-                print(f"处理调用参数出错: {str(e)}")  # 添加错误日志
-        
+                print(f"处理调用参数出错: {str(e)}")  
         short_result = shorten_tool_result(result)
         history.append({
             "role":"user",
@@ -756,7 +571,7 @@ def chat(user_query):
 if __name__ == '__main__':
     # chat('你好')
     chat(
-        '请分析192.168.0.110这台主机上周星期一和上上周星期一的cpu利用率还有昨天的用户cpu利用率，并作图给出分析报告')
+        '请分析192.168.0.110这台主机上周星期一和上上周星期一还有前天的cpu利用率，并作图给出分析报告')
 
 
 # === config.py ===
@@ -765,60 +580,54 @@ import json
 import os
 import logging
 
-# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("anomaly_detection")
 
-# 各个检测方法的权重配置 - 调整权重使得结果更合理
 WEIGHTS_SINGLE = {
     "Z-Score": 0.5,
     "CUSUM": 0.5
 }
 
 WEIGHTS_MULTI = {
-    "ResidualComparison": 0.4,  # 提高残差对比的权重
-    "TrendDriftCUSUM": 0.25,    # 降低CUSUM的权重
+    "ResidualComparison": 0.4, 
+    "TrendDriftCUSUM": 0.25,   
     "ChangeRate": 0.15,
     "TrendSlope": 0.2
 }
 
-# 综合分数阈值 - 提高阈值，减少误报
 HIGH_ANOMALY_THRESHOLD = 0.7
 MILD_ANOMALY_THRESHOLD = 0.4
 
-# 默认的各检测方法阈值配置 - 更加严格的阈值
 DEFAULT_THRESHOLD_CONFIG = {
     "Z-Score": {
-        "threshold": 3.5  # 增大Z-Score阈值，减少误检
+        "threshold": 3.5 
     },
     "CUSUM": {
-        "drift_threshold": 6.0,  # 增大偏移阈值
-        "k": 0.7  # 增大k值，减少对小波动的敏感度
+        "drift_threshold": 6.0, 
+        "k": 0.7  
     },
     "ResidualComparison": {
         "threshold": 3.5
     },
     "TrendDriftCUSUM": {
-        "drift_threshold": 8.0  # 显著增大阈值减少误报
+        "drift_threshold": 8.0 
     },
     "ChangeRate": {
-        "threshold": 0.7  # 增大变化率阈值
+        "threshold": 0.7
     },
     "TrendSlope": {
-        "slope_threshold": 0.4,  # 增大斜率阈值
+        "slope_threshold": 0.4, 
         "window": 5
     }
 }
 
-# 创建配置目录
 CONFIG_DIR = "config"
 os.makedirs(CONFIG_DIR, exist_ok=True)
 THRESHOLD_CONFIG_PATH = os.path.join(CONFIG_DIR, "threshold_config.json")
 
-# 如果不存在配置文件，创建一个默认配置
 if not os.path.exists(THRESHOLD_CONFIG_PATH):
     try:
         with open(THRESHOLD_CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -827,11 +636,9 @@ if not os.path.exists(THRESHOLD_CONFIG_PATH):
     except Exception as e:
         logger.warning(f"无法创建默认配置文件: {e}")
 
-# 加载用户定义的阈值配置
 try:
     with open(THRESHOLD_CONFIG_PATH, "r", encoding="utf-8") as f:
         USER_THRESHOLD_CONFIG = json.load(f)
-        # 合并用户配置与默认配置
         THRESHOLD_CONFIG = DEFAULT_THRESHOLD_CONFIG.copy()
         for method, config in USER_THRESHOLD_CONFIG.items():
             if method in THRESHOLD_CONFIG:
@@ -843,14 +650,7 @@ except Exception as e:
     logger.warning(f"无法读取阈值配置文件，使用默认值: {e}")
     THRESHOLD_CONFIG = DEFAULT_THRESHOLD_CONFIG
 
-# 数据库配置
-DB_CONFIG = {
-    'HOST': 'localhost',
-    'PORT': 3306,
-    'USER': 'aiops',
-    'PASSWORD': 'aiops123',
-    'NAME': 'aiops_monitoring'
-}
+
 
 # === utils/ts_cache.py ===
 # utils/ts_cache.py
@@ -862,44 +662,21 @@ import requests
 import datetime
 from typing import List, Tuple, Optional, Dict, Any
 
-# 配置
 CACHE_DIR = "cached_data"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# 后端API相关配置
 AIOPS_BACKEND_DOMAIN = 'https://aiopsbackend.cstcloud.cn'
 AUTH = ('chelseyyycheng@outlook.com', 'UofV1uwHwhVp9tcTue')
 
 def _cache_filename(ip: str, field: str, start_ts: int, end_ts: int) -> str:
-    """
-    生成缓存文件名
-    
-    参数:
-        ip: 主机IP
-        field: 指标字段
-        start_ts: 开始时间戳
-        end_ts: 结束时间戳
-    
-    返回:
-        str: 缓存文件路径
-    """
+
     key = f"{ip}_{field}_{start_ts}_{end_ts}"
     h = hashlib.md5(key.encode('utf-8')).hexdigest()
     return os.path.join(CACHE_DIR, f"{h}.pkl")
 
 def fetch_data_from_backend(ip: str, field: str, start_ts: int, end_ts: int) -> List[Tuple[int, float]]:
-    """
-    从后端API获取时序数据
-    
-    参数:
-        ip: 主机IP
-        field: 指标字段
-        start_ts: 开始时间戳
-        end_ts: 结束时间戳
-    
-    返回:
-        List[Tuple[int, float]]: 时间戳-值的列表
-    """
+    #从后端API获取时序数据
+
     url = f"{AIOPS_BACKEND_DOMAIN}/api/v1/monitor/mail/metric/format-value/?start={start_ts}&end={end_ts}&instance={ip}&field={field}"
     resp = requests.get(url, auth=AUTH)
     
@@ -934,19 +711,8 @@ def fetch_data_from_backend(ip: str, field: str, start_ts: int, end_ts: int) -> 
     return arr
 
 def ensure_cache_file(ip: str, field: str, start: str, end: str) -> str:
-    """
-    确保缓存文件存在，如果不存在则从后端获取
-    
-    参数:
-        ip: 主机IP
-        field: 指标字段
-        start: 开始时间 (格式: "YYYY-MM-DD HH:MM:SS")
-        end: 结束时间 (格式: "YYYY-MM-DD HH:MM:SS")
-    
-    返回:
-        str: 缓存文件路径
-    """
-    # 转换时间字符串为时间戳
+    #查询缓存文件，不存在从后端获取
+
     def to_int(s):
         dt = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
         return int(dt.timestamp())
@@ -954,20 +720,16 @@ def ensure_cache_file(ip: str, field: str, start: str, end: str) -> str:
     st_i = to_int(start)
     et_i = to_int(end)
     
-    # 生成缓存文件路径
     fpath = _cache_filename(ip, field, st_i, et_i)
     
-    # 检查缓存是否存在
     if os.path.exists(fpath):
         print(f"[缓存] 从本地缓存读取 {ip} {field} 数据")
         return fpath
     
-    # 从后端获取数据
     try:
         print(f"[API] 从后端获取 {ip} {field} 数据")
         data = fetch_data_from_backend(ip, field, st_i, et_i)
         
-        # 保存到缓存
         with open(fpath, "wb") as f:
             pickle.dump(data, f)
         
@@ -979,26 +741,13 @@ def ensure_cache_file(ip: str, field: str, start: str, end: str) -> str:
         return str(e)
 
 def load_series_from_cache(ip: str, field: str, start: str, end: str) -> List[Tuple[int, float]]:
-    """
-    从缓存加载时序数据
+
     
-    参数:
-        ip: 主机IP
-        field: 指标字段
-        start: 开始时间 (格式: "YYYY-MM-DD HH:MM:SS")
-        end: 结束时间 (格式: "YYYY-MM-DD HH:MM:SS")
-    
-    返回:
-        List[Tuple[int, float]]: 时间戳-值的列表
-    """
-    # 确保缓存文件存在
     cache_file = ensure_cache_file(ip, field, start, end)
     
-    # 检查路径是否为错误信息
     if not os.path.exists(cache_file):
         raise Exception(f"缓存文件不存在: {cache_file}")
     
-    # 从缓存加载数据
     with open(cache_file, "rb") as f:
         data = pickle.load(f)
     
@@ -1014,21 +763,48 @@ from utils.ts_cache import ensure_cache_file, load_series_from_cache
 
 # === utils/time_utils.py ===
 # utils/time_utils.py
-def group_anomaly_times(anomalies, max_gap=1800):
-    """
-    将时间戳列表分组为连续的时间区间
+import re
+import datetime
+import dateparser
+
+def parse_time_expressions(raw_text: str):
+
+    #解析自然语言时间表达式
     
-    参数:
-        anomalies: 时间戳列表
-        max_gap: 允许的最大间隔秒数
-        
-    返回:
-        list: [(start1, end1), (start2, end2), ...] 区间列表
-    """
+    segments = re.split(r'[,\uFF0C\u3001\u0026\u002C\u002F\u0020\u0026\u2014\u2013\u2014\u006E\u005E]|和|与|及|还有|、', raw_text)
+    results = []
+    
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+
+        dt = dateparser.parse(seg, languages=['zh', 'en'], settings={"PREFER_DATES_FROM": "past"})
+        if dt is None:
+            results.append({"start": 0, "end": 0, "error": f"无法解析: {seg}"})
+        else:
+            day_s = datetime.datetime(dt.year, dt.month, dt.day, 0, 0, 0)
+            day_e = datetime.datetime(dt.year, dt.month, dt.day, 23, 59, 59)
+            
+            start_str = day_s.strftime("%Y-%m-%d %H:%M:%S")
+            end_str = day_e.strftime("%Y-%m-%d %H:%M:%S")
+            
+            results.append({
+                "start": int(day_s.timestamp()),
+                "end": int(day_e.timestamp()),
+                "error": "",
+                "start_str": start_str,
+                "end_str": end_str
+            })
+    
+    return results
+
+def group_anomaly_times(anomalies, max_gap=1800):
+
+    #将时间戳列表分组为连续的时间区间
     if not anomalies:
         return []
     
-    # 排序输入
     sorted_anomalies = sorted(anomalies)
     
     intervals = []
@@ -1043,10 +819,22 @@ def group_anomaly_times(anomalies, max_gap=1800):
             cur_start = t
             cur_end = t
     
-    # 添加最后一个区间
     intervals.append((cur_start, cur_end))
     
     return intervals
+
+def format_timestamp(ts):
+    try:
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except:
+        return str(ts)
+
+def to_timestamp(time_str):
+    try:
+        dt = datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+        return int(dt.timestamp())
+    except Exception as e:
+        raise ValueError(f"时间字符串格式错误: {e}")
 
 # === output/report_generator.py ===
 # output/report_generator.py
@@ -1054,47 +842,22 @@ import os
 import json
 import re
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, Union
 
 import config
 from output.visualization import generate_summary_echarts_html
 
 def convert_markdown_to_html(markdown_text):
-    """
-    将Markdown文本转换为HTML
-    
-    参数:
-        markdown_text: Markdown格式的文本
-    
-    返回:
-        str: 转换后的HTML文本
-    """
-    # 转换标题
     html = markdown_text
-    
-    # 转换## 标题
     html = re.sub(r'^## (.*?)$', r'<h2>\1</h2>', html, flags=re.MULTILINE)
-    
-    # 转换### 标题
     html = re.sub(r'^### (.*?)$', r'<h3>\1</h3>', html, flags=re.MULTILINE)
-    
-    # 转换#### 标题
     html = re.sub(r'^#### (.*?)$', r'<h4>\1</h4>', html, flags=re.MULTILINE)
-    
-    # 转换# 标题
     html = re.sub(r'^# (.*?)$', r'<h1>\1</h1>', html, flags=re.MULTILINE)
-    
-    # 转换加粗
     html = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', html)
-    
-    # 转换斜体
     html = re.sub(r'\*(.*?)\*', r'<em>\1</em>', html)
-    
-    # 转换无序列表
-    # 先把所有无序列表项转换为临时标记
+
     html = re.sub(r'^- (.*?)$', r'<li>\1</li>', html, flags=re.MULTILINE)
-    
-    # 将连续的<li>项组合成<ul>列表
+
     li_pattern = r'(<li>.*?</li>)+'
     
     def replace_list(match):
@@ -1102,12 +865,8 @@ def convert_markdown_to_html(markdown_text):
         return f'<ul>{list_items}</ul>'
     
     html = re.sub(li_pattern, replace_list, html, flags=re.DOTALL)
-    
-    # 转换有序列表 (数字后跟点的格式)
     html = re.sub(r'^(\d+)\. (.*?)$', r'<li>\2</li>', html, flags=re.MULTILINE)
-    
-    # 转换段落 (连续的非标签文本)
-    # 先按换行符分割
+
     paragraphs = []
     buffer = ""
     
@@ -1133,38 +892,23 @@ def convert_markdown_to_html(markdown_text):
     return html
 
 def generate_llm_report(result, report_type="single", user_query=""):
-    """
-    使用大模型生成异常检测分析报告
-    
-    参数:
-        result: 异常检测结果
-        report_type: 报告类型，"single"单序列或"multi"多序列
-        user_query: 用户的原始查询
-        
-    返回:
-        str: 大模型生成的分析报告
-    """
-    # 构建完整的上下文信息
+    #大模型生成异常检测分析报告
+
     classification = result.get('classification', '未知')
     score = result.get('composite_score', 0)
     
-    # 获取异常点数量
     anomaly_count = len(result.get('anomaly_times', []))
     interval_count = len(result.get('anomaly_intervals', []))
     
-    # 提取方法结果信息
     method_results = result.get('method_results', [])
     method_details = []
     
     for method in method_results:
         if isinstance(method, dict):
-            # 如果已经是字典形式
             method_info = method
         else:
-            # 如果是对象，转为字典
             method_info = method.to_dict() if hasattr(method, 'to_dict') else vars(method)
         
-        # 提取关键信息
         method_name = method_info.get('method', '未知方法')
         anomalies = method_info.get('anomalies', [])
         intervals = method_info.get('intervals', [])
@@ -1175,58 +919,57 @@ def generate_llm_report(result, report_type="single", user_query=""):
                 "method": method_name,
                 "anomaly_count": len(anomalies),
                 "interval_count": len(intervals),
-                "explanations": explanations[:3]  # 限制长度
+                "explanations": explanations[:3]  #限制长度
             }
             method_details.append(detail)
     
-    # 构建提示文本
     if report_type == "single":
         prompt = f"""
-请为以下单序列异常检测结果生成一份详细的分析报告，报告应包含以下方面：
-1. 总体异常状况摘要
-2. 各检测方法发现的问题分析
-3. 可能的原因分析
-4. 建议的后续操作
+        请为以下单序列异常检测结果生成一份详细的分析报告，报告应包含以下方面：
+        1. 总体异常状况摘要
+        2. 各检测方法发现的问题分析
+        3. 可能的原因分析
+        4. 建议的后续操作
 
-检测结果信息：
-- 用户查询: {user_query}
-- 总体分类: {classification}
-- 综合得分: {score:.2f}
-- 发现异常点数: {anomaly_count}
+        检测结果信息：
+        用户查询: {user_query}
+        总体分类: {classification}
+        综合得分: {score:.2f}
+        发现异常点数: {anomaly_count}
 
-检测方法详情:
-{json.dumps(method_details, ensure_ascii=False, indent=2)}
+        检测方法详情:
+        {json.dumps(method_details, ensure_ascii=False, indent=2)}
 
-请注意以下要求：
-- 生成的报告应该使用Markdown格式，包含标题(##)、子标题(###)、列表项等
-- 每个部分应该使用二级标题(##)，内容要精炼但信息量丰富
-- 不要简单重复上述数据，而是提供有价值的见解和分析
-- 总长度控制在600字以内
+        请注意以下要求：
+        生成的报告应该使用Markdown格式，包含标题(##)、子标题(###)、列表项等
+        每个部分应该使用二级标题(##)，内容要精炼但信息量丰富
+        不要简单重复上述数据，而是提供有价值的见解和分析
+        总长度控制在600字左右
 """
-    else:  # multi
+    else:  #multi
         prompt = f"""
-请为以下多序列对比异常检测结果生成一份详细的分析报告，报告应包含以下方面：
-1. 两个序列的对比摘要
-2. 差异模式与趋势分析
-3. 各检测方法发现的问题详解
-4. 异常的可能原因
-5. 建议的后续操作
+        请为以下多序列对比异常检测结果生成一份详细的分析报告，报告应包含以下方面：
+        1. 两个序列的对比摘要
+        2. 差异模式与趋势分析
+        3. 各检测方法发现的问题详解
+        4. 异常的可能原因
+        5. 建议的后续操作
 
-检测结果信息：
-- 用户查询: {user_query}
-- 总体分类: {classification}
-- 综合得分: {score:.2f}
-- 发现异常点数: {anomaly_count}
-- 发现异常区间数: {interval_count}
+        检测结果信息：
+        用户查询: {user_query}
+        总体分类: {classification}
+        综合得分: {score:.2f}
+        发现异常点数: {anomaly_count}
+        发现异常区间数: {interval_count}
 
-检测方法详情:
-{json.dumps(method_details, ensure_ascii=False, indent=2)}
+        检测方法详情:
+        {json.dumps(method_details, ensure_ascii=False, indent=2)}
 
-请注意以下要求：
-- 生成的报告应该使用Markdown格式，包含标题(##)、子标题(###)、列表项等
-- 每个部分应该使用二级标题(##)，内容要精炼但信息量丰富
-- 不要简单重复上述数据，而是提供有价值的见解和分析
-- 总长度控制在600字以内
+        请注意以下要求：
+        生成的报告应该使用Markdown格式，包含标题(##)、子标题(###)、列表项等
+        每个部分应该使用二级标题(##)，内容要精炼但信息量丰富
+        不要简单重复上述数据，而是提供有价值的见解和分析
+        总长度控制在600字左右
 """
 
     # 调用大模型生成报告
@@ -1236,7 +979,6 @@ def generate_llm_report(result, report_type="single", user_query=""):
     ]
     
     try:
-        # 导入位于上层的llm_call函数
         import sys, os
         sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
         from agent import llm_call
@@ -1252,181 +994,132 @@ def generate_llm_report(result, report_type="single", user_query=""):
         return f"## 异常检测报告\n\n**分类**: {classification}\n**得分**: {score:.2f}\n**异常点数**: {anomaly_count}"
 
 
-def generate_report_single(series, ip, field, user_query):
-    """
-    为单序列异常检测生成汇总报告
+def generate_common_report(series_data, metadata, detection_type, user_query=""):
     
-    参数:
-        series: 时序数据 [(ts, value), ...]
-        ip: 主机IP
-        field: 指标字段
-        user_query: 用户查询
-    
-    返回:
-        dict: 报告结果包含图表路径和分析结果
-    """
-    # 执行异常检测
-    from analysis.single_series import analyze_single_series
-    result = analyze_single_series(series)
-    method_results = result["method_results"]
-    
-    # 创建输出目录
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = f"output/plots/{ip}_{field}_{timestamp}"
-    os.makedirs(base_dir, exist_ok=True)
     
-    # 提取时间信息构建 series_info
-    start_time = datetime.fromtimestamp(series[0][0]).strftime("%Y-%m-%d %H:%M:%S") if series else "未知"
-    end_time = datetime.fromtimestamp(series[-1][0]).strftime("%Y-%m-%d %H:%M:%S") if series else "未知"
+    if detection_type == "single":
+        # 单序列
+        series = series_data
+        ip = metadata.get("ip", "unknown")
+        field = metadata.get("field", "unknown")
+        
+        base_dir = f"output/plots/{ip}_{field}_{timestamp}"
+        os.makedirs(base_dir, exist_ok=True)
+        
+        chart_title = f"{ip} {field} 异常检测汇总图"
+        
+        from analysis.single_series import analyze_single_series
+        result = analyze_single_series(series)
+        series2 = None
+        
+        start_time = datetime.fromtimestamp(series[0][0]).strftime("%Y-%m-%d %H:%M:%S") if series else "未知"
+        end_time = datetime.fromtimestamp(series[-1][0]).strftime("%Y-%m-%d %H:%M:%S") if series else "未知"
+        
+        series_info = {"ip": ip, "field": field, "start": start_time, "end": end_time}
+        
+    else:  # multi
+        series1, series2 = series_data
+        ip1 = metadata.get("ip1", "unknown")
+        ip2 = metadata.get("ip2", "unknown")
+        field = metadata.get("field", "unknown")
+        
+        base_dir = f"output/plots/{ip1}_{ip2}_{field}_{timestamp}"
+        os.makedirs(base_dir, exist_ok=True)
+        
+        chart_title = f"{ip1} vs {ip2} {field} 对比异常检测汇总图"
+        
+        from analysis.multi_series import analyze_multi_series
+        result = analyze_multi_series(series1, series2)
+        
+        series_info = {"ip1": ip1, "ip2": ip2, "field": field}
     
-    series_info = {
-        "ip": ip,
-        "field": field,
-        "start": start_time,
-        "end": end_time
-    }
-    
-    # 生成汇总图表
+    method_results = result["method_results"]
     summary_path = os.path.join(base_dir, "summary.html")
     chart_path, tooltip_map = generate_summary_echarts_html(
-        series, None, method_results, summary_path, 
-        title=f"{ip} {field} 异常检测汇总图"
+        series_data if detection_type == "single" else series_data[0], 
+        series2, 
+        method_results, 
+        summary_path, 
+        title=chart_title
     )
     
-    # 调用大模型生成详细的分析报告
     print(f"调用大模型生成报告，用户查询: {user_query}")
-    llm_analysis = generate_llm_report(result, "single", user_query)
+    llm_analysis = generate_llm_report(result, detection_type, user_query)
     print(f"大模型生成的报告长度: {len(llm_analysis)}")
     
-    # 生成最终报告
     final_report_path = os.path.join(base_dir, "final_report.html")
     generate_report_html(
         user_query, chart_path, method_results, tooltip_map, final_report_path, 
         composite_score=result["composite_score"],
         classification=result["classification"],
-        llm_analysis=llm_analysis
+        llm_analysis=llm_analysis,
+        is_multi_series=(detection_type == "multi")
     )
     
-    # 返回结果
-    return {
+    result_dict = {
         "classification": result["classification"],
         "composite_score": result["composite_score"],
         "anomaly_times": result["anomaly_times"],
-        "method_results": [mr.to_dict() for mr in method_results],
+        "method_results": [mr.to_dict() if hasattr(mr, 'to_dict') else mr for mr in method_results],
         "report_path": final_report_path,
         "llm_analysis": llm_analysis
     }
+    
+    if detection_type == "multi":
+        result_dict["anomaly_intervals"] = result["anomaly_intervals"]
+    
+    return result_dict
+
+
+def generate_report_single(series, ip, field, user_query):
+    metadata = {"ip": ip, "field": field}
+    return generate_common_report(series, metadata, "single", user_query)
 
 
 def generate_report_multi(series1, series2, ip1, ip2, field, user_query):
-    """
-    为多序列对比异常检测生成汇总报告
-    
-    参数:
-        series1: 第一个时序数据 [(ts, value), ...]
-        series2: 第二个时序数据 [(ts, value), ...]
-        ip1: 第一个主机IP
-        ip2: 第二个主机IP
-        field: 指标字段
-        user_query: 用户查询
-    
-    返回:
-        dict: 报告结果包含图表路径和分析结果
-    """
-    # 执行多序列对比异常检测
-    from analysis.multi_series import analyze_multi_series
-    result = analyze_multi_series(series1, series2)
-    method_results = result["method_results"]
-    
-    # 创建输出目录
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = f"output/plots/{ip1}_{ip2}_{field}_{timestamp}"
-    os.makedirs(base_dir, exist_ok=True)
-    
-    # 生成汇总图表 - 传递两个序列
-    summary_path = os.path.join(base_dir, "summary.html")
-    chart_path, tooltip_map = generate_summary_echarts_html(
-        series1, series2, method_results, summary_path,
-        title=f"{ip1} vs {ip2} {field} 对比异常检测汇总图"
-    )
-    
-    # 调用大模型生成详细的分析报告
-    print(f"调用大模型生成报告，用户查询: {user_query}")
-    llm_analysis = generate_llm_report(result, "multi", user_query)
-    print(f"大模型生成的报告长度: {len(llm_analysis)}")
-    
-    # 生成最终报告
-    final_report_path = os.path.join(base_dir, "final_report.html")
-    generate_report_html(
-        user_query, chart_path, method_results, tooltip_map, final_report_path,
-        composite_score=result["composite_score"], 
-        classification=result["classification"],
-        llm_analysis=llm_analysis,
-        is_multi_series=True
-    )
-    
-    # 返回结果
-    return {
-        "classification": result["classification"],
-        "composite_score": result["composite_score"],
-        "anomaly_times": result["anomaly_times"],
-        "anomaly_intervals": result["anomaly_intervals"],
-        "method_results": [mr.to_dict() for mr in method_results],
-        "report_path": final_report_path,
-        "llm_analysis": llm_analysis
-    }
+    metadata = {"ip1": ip1, "ip2": ip2, "field": field}
+    return generate_common_report((series1, series2), metadata, "multi", user_query)
 
 
 def generate_report_html(user_query, chart_path, detection_results, tooltip_map, output_path, 
                           composite_score=0.0, classification="正常", llm_analysis=None, is_multi_series=False):
-    """
-    生成异常检测HTML报告
     
-    参数:
-        user_query: 用户原始查询
-        chart_path: 图表HTML路径
-        detection_results: 检测结果列表
-        tooltip_map: 异常点/区间映射
-        output_path: 输出HTML报告路径
-        composite_score: 综合得分
-        classification: 分类结果
-        llm_analysis: 大模型生成的分析报告
-        is_multi_series: 是否为多序列分析
+    #异常检测HTML报告
     
-    返回:
-        str: 生成的报告路径
-    """
-    # 设置报告样式类
     if classification == "高置信度异常":
         alert_class = "alert-danger"
     elif classification == "轻度异常":
         alert_class = "alert-warning"
     else:
         alert_class = "alert-success"
-    
-    # 构建方法摘要HTML
+
     methods_summary_html = ""
     for result in detection_results:
+        if isinstance(result, dict):
+            method = result.get("method", "未知")
+            description = result.get("description", "")
+        else:
+            method = result.method if hasattr(result, 'method') else "未知"
+            description = result.description if hasattr(result, 'description') else ""
+            
         methods_summary_html += f"""
         <div class="card mb-2">
             <div class="card-header">
-                <strong>{result.method}</strong>
+                <strong>{method}</strong>
             </div>
             <div class="card-body">
-                <p>{result.description}</p>
+                <p>{description}</p>
             </div>
         </div>
         """
-    
-    # 处理LLM分析文本 - 使用更完善的Markdown解析
+   
     formatted_llm_analysis = ""
     if llm_analysis:
-        # 使用更完善的Markdown到HTML转换
         formatted_llm_analysis = convert_markdown_to_html(llm_analysis)
     
     report_title = "多序列对比异常检测报告" if is_multi_series else "时序数据异常检测报告"
     
-    # 构建完整HTML报告
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -1494,11 +1187,10 @@ def generate_report_html(user_query, chart_path, detection_results, tooltip_map,
                     <p>综合得分: {composite_score:.2f}</p>
                 </div>
                 
-                <!-- AI分析报告 -->
+                <!-- 大模型分析报告 -->
                 <div class="ai-analysis">
-                    <div class="ai-analysis-title">AI辅助分析报告</div>
                     <div class="markdown-content">
-                        {formatted_llm_analysis if llm_analysis else "未生成AI分析报告"}
+                        {formatted_llm_analysis if llm_analysis else "未生成分析报告"}
                     </div>
                 </div>
             </div>
@@ -1510,7 +1202,7 @@ def generate_report_html(user_query, chart_path, detection_results, tooltip_map,
             </div>
             <div class="card-body p-0">
                 <div class="info-box">
-                    <p class="hint-text">提示: 将鼠标悬停在异常点或异常区间上可查看详细信息。异常点/区间以红色标记并带有编号。</p>
+                    <p class="hint-text">提示: 将鼠标悬停在异常点上可查看详细信息。</p>
                 </div>
                 <iframe class="iframe-container" src="{os.path.basename(chart_path)}"></iframe>
             </div>
@@ -1528,27 +1220,14 @@ def generate_report_html(user_query, chart_path, detection_results, tooltip_map,
 </body>
 </html>"""
 
-    # 写入文件
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
-
     return output_path
 
 def get_anomaly_detection_report(result, detection_type):
-    """
-    根据异常检测结果生成报告
-    
-    参数:
-        result: 异常检测结果
-        detection_type: 检测类型 ("single" 或 "multi")
-        
-    返回:
-        str: 格式化的报告文本
-    """
-    # 使用大模型生成报告
+
     llm_analysis = generate_llm_report(result, detection_type, result.get("user_query", ""))
-    
-    # 准备报告标题和基本信息
+
     if detection_type == "single":
         title = "单序列异常检测报告"
         anomaly_info = f"**异常点数**：{len(result['anomaly_times'])}"
@@ -1556,16 +1235,13 @@ def get_anomaly_detection_report(result, detection_type):
         title = "多序列对比异常检测报告"
         anomaly_info = f"**异常段数**：{len(result.get('anomaly_intervals', []))}"
     
-    # 生成最终报告
     final_report = f"""
-## {title}
-
-**结论**：{result['classification']}  
-**综合得分**：{result['composite_score']:.2f}  
+    ## {title}
+    **结论**：{result['classification']}  
+    **综合得分**：{result['composite_score']:.2f}  
 {anomaly_info}
 
 {llm_analysis}
-
 **图表路径**：{result['report_path']}
 """
     return final_report
@@ -1577,29 +1253,133 @@ import uuid
 import os
 import time
 from datetime import datetime
-from typing import List, Dict, Tuple, Any, Optional
+from typing import List, Dict, Tuple, Any, Optional, Union
+from utils.time_utils import format_timestamp
 
-def generate_summary_echarts_html(series1, series2=None, detection_results=None, output_path=None, title="时序异常检测汇总图"):
-    """
-    生成融合所有方法的汇总异常检测可视化图表
+def process_anomaly_points(detection_results, series_data, timestamps):
     
-    参数:
-        series1: 第一个时序数据 [(timestamp, value), ...]
-        series2: 可选，第二个时序数据，用于多序列对比
-        detection_results: 多个检测器结果列表 [DetectionResult, ...]
-        output_path: 输出HTML文件路径
-        title: 图表标题
+    mark_points = []
+    tooltip_map = {}
+    point_counter = 1
     
-    返回:
-        output_path: 输出的HTML文件路径
-        tooltip_map: 异常点映射，用于报告中解释关联
-    """
-    if detection_results is None:
-        detection_results = []
+    for result in detection_results:
+        if not hasattr(result, 'visual_type') or result.visual_type != "point":
+            continue
+            
+        anomalies = result.anomalies if hasattr(result, 'anomalies') else []
+        explanations = result.explanation if hasattr(result, 'explanation') else []
         
-    chart_id = f"chart_summary_{uuid.uuid4().hex[:8]}"
+        for i, ts in enumerate(anomalies):
+            value = next((v for t, v in series_data if t == ts), None)
+            if value is None:
+                continue
 
-    # 主序列数据 - 修改名称和数据格式
+            explanation = ""
+            if i < len(explanations):
+                explanation = explanations[i]
+            
+            tooltip_map[point_counter] = {
+                "method": result.method if hasattr(result, 'method') else "未知方法",
+                "ts": ts,
+                "value": value,
+                "explanation": explanation
+            }
+            
+            mark_points.append({
+                "coord": [ts * 1000, value],
+                "symbol": "circle",
+                "symbolSize": 8,
+                "itemStyle": {"color": "red"},
+                "label": {"formatter": f"#{point_counter}", "show": True, "position": "top"},
+                "anomalyInfo": {
+                    "id": point_counter,
+                    "method": result.method if hasattr(result, 'method') else "未知方法",
+                    "timestamp": format_timestamp(ts),
+                    "value": value,
+                    "explanation": explanation
+                }
+            })
+            
+            point_counter += 1
+            
+    return mark_points, tooltip_map
+
+def process_anomaly_ranges(detection_results, timestamps):
+    
+    mark_areas = []
+    tooltip_map = {}
+    point_counter = 1
+    
+    for result in detection_results:
+        if not hasattr(result, 'visual_type') or result.visual_type not in ("range", "curve"):
+            continue
+            
+        intervals = result.intervals if hasattr(result, 'intervals') else []
+        explanations = result.explanation if hasattr(result, 'explanation') else []
+        
+        for i, (start, end) in enumerate(intervals):
+            area_explanation = ""
+            if i < len(explanations):
+                area_explanation = explanations[i]
+                
+            tooltip_map[point_counter] = {
+                "method": result.method if hasattr(result, 'method') else "未知方法",
+                "ts_start": start,
+                "ts_end": end,
+                "explanation": area_explanation
+            }
+            
+            mark_areas.append({
+                "itemStyle": {"color": "rgba(255, 100, 100, 0.2)"},
+                "label": {"show": True, "position": "top", "formatter": f"#{point_counter}"},
+                "xAxis": start * 1000,
+                "xAxis2": end * 1000,
+                "anomalyInfo": {
+                    "id": point_counter,
+                    "method": result.method if hasattr(result, 'method') else "未知方法",
+                    "startTime": format_timestamp(start),
+                    "endTime": format_timestamp(end),
+                    "explanation": area_explanation
+                }
+            })
+            
+            point_counter += 1
+            
+    return mark_areas, tooltip_map
+
+def process_auxiliary_curves(detection_results, timestamps):
+    #处理辅助曲线数据
+    
+    extra_series = []
+    for result in detection_results:
+        # 跳过非曲线类型或没有辅助曲线的结果
+        if not hasattr(result, 'visual_type') or result.visual_type != "curve":
+            continue
+        if not hasattr(result, 'auxiliary_curve') or not result.auxiliary_curve:
+            continue
+    
+        #是否使用第二个Y轴
+        use_second_yaxis = False
+        if hasattr(result, 'method'):
+            use_second_yaxis = result.method in ["CUSUM", "TrendDriftCUSUM"]
+            
+        yAxisIndex = 1 if use_second_yaxis else 0
+        curve_data = [[t * 1000, v] for t, v in result.auxiliary_curve]
+        
+        extra_series.append({
+            "name": f"{result.method if hasattr(result, 'method') else '辅助'} 辅助曲线",
+            "type": "line",
+            "yAxisIndex": yAxisIndex,
+            "data": curve_data,
+            "lineStyle": {"type": "dashed", "width": 1.5},
+            "itemStyle": {"color": "#EE6666"},
+            "showSymbol": False
+        })
+            
+    return extra_series
+
+def prepare_series_data(series1, series2=None):
+   
     series_list = [{
         "name": series2 is not None and "上周CPU利用率" or "原始序列",
         "type": "line",
@@ -1608,22 +1388,20 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
         "lineStyle": {"width": 2},
         "itemStyle": {"color": "#5470C6"}
     }]
-    
-    # 添加第二个序列（如果存在）
+
     if series2 is not None:
-        # 将两个序列的时间范围对齐
+        #时间范围对齐
         min_time = min(series1[0][0], series2[0][0])
-        offset1 = series1[0][0] - min_time  # 第一个序列相对于较早开始时间的偏移
-        offset2 = series2[0][0] - min_time  # 第二个序列相对于较早开始时间的偏移
+        offset1 = series1[0][0] - min_time 
+        offset2 = series2[0][0] - min_time
         
-        # 将时间戳调整为相对时间，这样两个序列可以在图表上对齐
         adjusted_series2 = [(t - offset2 + offset1, v) for t, v in series2]
         
         series_list.append({
             "name": "这周CPU利用率",
             "type": "line",
             "data": [[t * 1000, v] for t, v in adjusted_series2],
-            "symbolSize": 0,  # 减小正常点的大小
+            "symbolSize": 0,
             "lineStyle": {"width": 2},
             "itemStyle": {"color": "#91CC75"}
         })
@@ -1639,116 +1417,33 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
                 "name": "差值曲线",
                 "type": "line",
                 "data": diff_data,
-                "symbolSize": 0,  # 减小正常点的大小
+                "symbolSize": 0, 
                 "lineStyle": {"width": 1, "type": "dashed"},
                 "itemStyle": {"color": "#EE6666"}
             })
+    
+    return series_list
 
-    mark_points = []
-    mark_areas = []
-    extra_series = []
-    tooltip_map = {}
-
-    point_counter = 1  # 异常点序号
-    explanation_counter = 1  # 解释编号
-
-    for result in detection_results:
-        # 处理点异常
-        if result.visual_type == "point":
-            for i, ts in enumerate(result.anomalies):
-                value = next((v for t, v in series1 if t == ts), None)
-                if value is None:
-                    continue
-                
-                # 构建标签和提示信息
-                explanation = ""
-                if i < len(result.explanation):
-                    explanation = result.explanation[i]
-                
-                # 存储对应关系，用于报告生成
-                tooltip_map[point_counter] = {
-                    "method": result.method,
-                    "ts": ts,
-                    "value": value,
-                    "explanation": explanation
-                }
-                explanation_counter += 1
-                
-                # 添加标记点，将异常信息存储在数据中供自定义tooltip使用
-                mark_points.append({
-                    "coord": [ts * 1000, value],
-                    "symbol": "circle",
-                    "symbolSize": 8,
-                    "itemStyle": {"color": "red"},
-                    "label": {"formatter": f"#{point_counter}", "show": True, "position": "top"},
-                    "anomalyInfo": {
-                        "id": point_counter,
-                        "method": result.method,
-                        "timestamp": format_timestamp(ts),
-                        "value": value,
-                        "explanation": explanation
-                    }
-                })
-                point_counter += 1
-
-        # 处理区间异常
-        if result.visual_type in ("range", "curve"):
-            for i, (start, end) in enumerate(result.intervals):
-                # 获取区间解释
-                area_explanation = ""
-                if i < len(result.explanation):
-                    area_explanation = result.explanation[i]
-                
-                # 存储对应关系
-                tooltip_map[point_counter] = {
-                    "method": result.method,
-                    "ts_start": start,
-                    "ts_end": end,
-                    "explanation": area_explanation
-                }
-                
-                # 添加标记区域，将异常信息存储在数据中供自定义tooltip使用
-                mark_areas.append({
-                    "itemStyle": {"color": "rgba(255, 100, 100, 0.2)"},
-                    "label": {"show": True, "position": "top", "formatter": f"#{point_counter}"},
-                    "xAxis": start * 1000,
-                    "xAxis2": end * 1000,
-                    "anomalyInfo": {
-                        "id": point_counter,
-                        "method": result.method,
-                        "startTime": format_timestamp(start),
-                        "endTime": format_timestamp(end),
-                        "explanation": area_explanation
-                    }
-                })
-                
-                point_counter += 1
-                explanation_counter += 1
-
-        # 处理辅助曲线 - 使用第二个y轴
-        if result.visual_type == "curve" and result.auxiliary_curve:
-            # 检查方法名来确定是否使用第二个Y轴
-            use_second_yaxis = result.method in ["CUSUM", "TrendDriftCUSUM"]
-            yAxisIndex = 1 if use_second_yaxis else 0
-            
-            curve_data = [[t * 1000, v] for t, v in result.auxiliary_curve]
-            extra_series.append({
-                "name": f"{result.method} 辅助曲线",
-                "type": "line",
-                "yAxisIndex": yAxisIndex,  # 使用右侧Y轴
-                "data": curve_data,
-                "lineStyle": {"type": "dashed", "width": 1.5},
-                "itemStyle": {"color": "#EE6666"},
-                "showSymbol": False
-            })
-
-    # 合并所有系列
+def generate_summary_echarts_html(series1, series2=None, detection_results=None, output_path=None, title="时序异常检测汇总图"):
+    
+    if detection_results is None:
+        detection_results = []
+        
+    chart_id = f"chart_summary_{uuid.uuid4().hex[:8]}"
+    timestamps = [t for t, _ in series1]
+    
+    series_list = prepare_series_data(series1, series2)
+    
+    mark_points, tooltip_map_points = process_anomaly_points(detection_results, series1, timestamps)
+    mark_areas, tooltip_map_areas = process_anomaly_ranges(detection_results, timestamps)
+    extra_series = process_auxiliary_curves(detection_results, timestamps)
+    
     series_list.extend(extra_series)
     
-    # 检查是否需要第二个Y轴
+    tooltip_map = {**tooltip_map_points, **tooltip_map_areas}
+    
     need_second_yaxis = any(s.get("yAxisIndex", 0) == 1 for s in series_list)
 
-    # 构建 ECharts 选项
     option = {
         "title": {"text": title, "left": "center"},
         "tooltip": {
@@ -1777,8 +1472,8 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
             "name": "时间",
             "axisLabel": {
                 "formatter": "{yyyy}-{MM}-{dd} {HH}:{mm}",
-                "rotate": 30,  # 旋转标签以避免重叠
-                "margin": 15   # 增加边距
+                "rotate": 30,
+                "margin": 15
             }
         },
         "yAxis": [
@@ -1791,7 +1486,6 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
         ]
     }
     
-    # 添加第二个Y轴（如果需要）
     if need_second_yaxis:
         option["yAxis"].append({
             "type": "value",
@@ -1800,7 +1494,6 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
             "splitLine": {"show": False}
         })
 
-    # 整合标记点和标记区域
     if mark_points:
         series_list[0]["markPoint"] = {
             "data": mark_points, 
@@ -1816,8 +1509,19 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
             "emphasis": {"focus": "self"}
         }
 
-    # 生成HTML，添加自定义JavaScript处理异常点的tooltip
-    html = f"""<!DOCTYPE html>
+    #异常点的tooltip
+    html = generate_html_template(chart_id, option, title)
+
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        return output_path, tooltip_map
+    else:
+        return html, tooltip_map
+
+def generate_html_template(chart_id, option, title):
+    return f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -1828,7 +1532,7 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
         #container {{ width: 100%; height: 100vh; }}
         #{chart_id} {{ width: 100%; height: 650px; }}
         
-        /* 自定义异常点提示样式 */
+        /* 异常点提示样式 */
         .anomaly-tooltip {{
             background-color: rgba(255, 255, 255, 0.9);
             border: 1px solid #ccc;
@@ -1868,7 +1572,6 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
         var chart = echarts.init(document.getElementById('{chart_id}'));
         var option = {json.dumps(option, ensure_ascii=False)};
         
-        // 自定义tooltip处理函数
         chart.on('mouseover', function(params) {{
             if (params.componentType === 'markPoint' && params.data && params.data.anomalyInfo) {{
                 var info = params.data.anomalyInfo;
@@ -1910,7 +1613,7 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
         
         chart.on('mouseout', function(params) {{
             if (params.componentType === 'markPoint' || params.componentType === 'markArea') {{
-                // 恢复默认tooltip
+                //恢复默认tooltip
                 chart.setOption({{
                     tooltip: {{
                         formatter: null,
@@ -1927,207 +1630,6 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
     </script>
 </body>
 </html>"""
-
-    # 确保输出目录存在
-    if output_path:
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        # 写入文件
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(html)
-        return output_path, tooltip_map
-    else:
-        return html, tooltip_map
-
-def format_timestamp(ts):
-    """将时间戳格式化为可读时间"""
-    from datetime import datetime
-    try:
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-    except:
-        return str(ts)
-
-# 向后兼容函数
-def generate_echarts_html_single(series, anomalies, title="单序列异常检测"):
-    """
-    向后兼容函数 - 生成单序列异常检测图表
-    """
-    from detectors.base import DetectionResult
-    import time
-    
-    # 将旧格式转换为检测结果对象
-    result = DetectionResult(
-        method="Legacy",
-        anomalies=anomalies,
-        description="旧版接口生成的异常检测图表",
-        visual_type="point"
-    )
-    
-    path = f"output/plots/legacy_single_{int(time.time())}.html"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    
-    chart_path, _ = generate_summary_echarts_html(
-        series, None, [result], path, title
-    )
-    
-    return chart_path
-
-def generate_echarts_html_multi(series1, series2, anomalies, title="多序列对比异常检测"):
-    """
-    向后兼容函数 - 生成多序列对比异常检测图表
-    """
-    from detectors.base import DetectionResult
-    import time
-    
-    # 将旧格式转换为检测结果对象
-    result = DetectionResult(
-        method="Legacy",
-        anomalies=anomalies,
-        description="旧版接口生成的异常检测图表",
-        visual_type="point"
-    )
-    
-    path = f"output/plots/legacy_multi_{int(time.time())}.html"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    
-    chart_path, _ = generate_summary_echarts_html(
-        series1, series2, [result], path, title
-    )
-    
-    return chart_path
-
-# === output/analysis_summary.py ===
-# output/analysis_summary.py
-import datetime
-from typing import List, Dict, Any
-
-def generate_text_analysis(detection_results: List, composite_score: float, classification: str, 
-                          series_info: Dict, is_multi_series: bool = False) -> str:
-    """
-    生成易于理解的文字分析报告
-    
-    参数:
-        detection_results: 检测结果列表
-        composite_score: 综合得分
-        classification: 分类结果 ('正常', '轻度异常', '高置信度异常')
-        series_info: 关于数据的信息 {"ip": str, "field": str, "start": str, "end": str}
-        is_multi_series: 是否是多序列分析
-        
-    返回:
-        str: 结构化的文字分析报告
-    """
-    # 提取基本信息
-    ip = series_info.get("ip", "未知主机")
-    field = series_info.get("field", "未知指标")
-    start_time = series_info.get("start", "未知开始时间")
-    end_time = series_info.get("end", "未知结束时间")
-    
-    # 检测统计信息
-    total_anomalies = sum(len(result.anomalies) for result in detection_results)
-    total_intervals = sum(len(result.intervals) for result in detection_results)
-    methods_with_anomalies = [r.method for r in detection_results if len(r.anomalies) > 0 or len(r.intervals) > 0]
-    
-    # 格式化时间
-    try:
-        start_dt = datetime.datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
-        end_dt = datetime.datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
-        period_desc = f"{start_dt.strftime('%Y年%m月%d日 %H:%M')} 至 {end_dt.strftime('%Y年%m月%d日 %H:%M')}"
-    except:
-        period_desc = f"{start_time} 至 {end_time}"
-    
-    # 根据评分生成总体分析
-    if classification == "正常":
-        summary_line = f"系统运行正常，未发现明显异常。"
-        if total_anomalies > 0:
-            summary_line += f" 虽然检测到 {total_anomalies} 个可能的异常点，但整体影响较小，综合评分为 {composite_score:.2f}，低于异常阈值。"
-    elif classification == "轻度异常":
-        summary_line = f"系统运行存在轻微异常，综合评分为 {composite_score:.2f}。"
-        if total_anomalies > 0:
-            summary_line += f" 共检测到 {total_anomalies} 个异常点，可能需要关注。"
-    else:  # 高置信度异常
-        summary_line = f"系统运行存在明显异常，综合评分为 {composite_score:.2f}，超过高置信阈值。"
-        if total_anomalies > 0:
-            summary_line += f" 共检测到 {total_anomalies} 个异常点，强烈建议进一步分析。"
-    
-    # 构建详细分析报告
-    if is_multi_series:
-        ip2 = series_info.get("ip2", "第二组数据")
-        analysis_text = f"""## {ip} vs {ip2} {field} 对比分析报告
-
-**分析时段**: {period_desc}
-
-**总体分析**: {summary_line}
-
-**检测方法详情**:
-"""
-    else:
-        analysis_text = f"""## {ip} {field} 异常检测报告
-
-**分析时段**: {period_desc}
-
-**总体分析**: {summary_line}
-
-**检测方法详情**:
-"""
-
-    # 添加各个检测方法的详细分析
-    for result in detection_results:
-        # 跳过无异常的方法
-        if not result.anomalies and not result.intervals:
-            continue
-            
-        method_desc = result.description
-        
-        # 处理不同类型的异常
-        if result.visual_type == "point" and result.anomalies:
-            analysis_text += f"\n- **{result.method}**: 检测到 {len(result.anomalies)} 个异常点。"
-            
-            # 添加代表性异常的解释
-            if result.explanation and len(result.explanation) > 0:
-                max_examples = min(3, len(result.explanation))
-                analysis_text += " 典型异常表现为: "
-                for i in range(max_examples):
-                    # 尝试将时间戳转换为可读时间
-                    try:
-                        ts = result.anomalies[i]
-                        ts_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-                        analysis_text += f"{ts_str} - {result.explanation[i]}; "
-                    except:
-                        analysis_text += f"{result.explanation[i]}; "
-        
-        elif result.visual_type in ("range", "curve") and result.intervals:
-            analysis_text += f"\n- **{result.method}**: 检测到 {len(result.intervals)} 个异常区间。"
-            
-            # 添加代表性区间的解释
-            if result.explanation and len(result.explanation) > 0:
-                max_examples = min(2, len(result.explanation))
-                analysis_text += " 典型异常区间表现为: "
-                for i in range(max_examples):
-                    try:
-                        start, end = result.intervals[i]
-                        start_str = datetime.datetime.fromtimestamp(start).strftime("%H:%M:%S")
-                        end_str = datetime.datetime.fromtimestamp(end).strftime("%H:%M:%S")
-                        analysis_text += f"{start_str}至{end_str} - {result.explanation[i]}; "
-                    except:
-                        analysis_text += f"{result.explanation[i]}; "
-        
-        elif result.visual_type == "none" and result.explanation:
-            analysis_text += f"\n- **{result.method}**: {' '.join(result.explanation[:2])}"
-    
-    # 添加建议和结论
-    analysis_text += "\n\n**建议**:\n"
-    
-    if classification == "正常":
-        analysis_text += "- 系统运行状态良好，可继续当前运维策略。"
-    elif classification == "轻度异常":
-        analysis_text += f"- 关注 {field} 指标的变化趋势，尤其是 {', '.join(methods_with_anomalies[:2])} 检测到的异常点。\n"
-        analysis_text += "- 考虑设置该指标的监控告警，避免问题恶化。"
-    else:  # 高置信度异常
-        analysis_text += f"- 建议立即排查 {field} 指标异常的根本原因，特别是 {', '.join(methods_with_anomalies[:2])} 检测到的问题。\n"
-        analysis_text += "- 检查系统配置和相关依赖组件状态。\n"
-        analysis_text += "- 考虑与其他指标交叉分析，确定影响范围。"
-    
-    return analysis_text
 
 # === output/__init__.py ===
 
@@ -3523,56 +3025,4 @@ class CUSUMDetector:
             visual_type="curve",
             explanation=explanations
         )
-
-# === storage/database.py ===
-import json
-import config
-try:
-    import pymysql
-except ImportError:
-    pymysql = None
-
-def save_analysis_record(record):
-    """
-    保存分析记录到 MySQL 数据库。
-    record: dict 包含 ip, field, start_time, end_time, methods, anomalies, composite_score, classification, report 等
-    """
-    ip = record.get("ip")
-    field = record.get("field")
-    start = record.get("start_time")
-    end = record.get("end_time")
-    methods = record.get("methods")
-    anomalies = record.get("anomaly_times")
-    composite_score = record.get("composite_score")
-    classification = record.get("classification")
-    report = record.get("report")
-    methods_json = json.dumps(methods, ensure_ascii=False)
-    anomalies_json = json.dumps(anomalies, ensure_ascii=False)
-    insert_sql = (
-        "INSERT INTO anomaly_analysis_records "
-        "(ip, field, start_time, end_time, methods, anomalies, composite_score, classification, report) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
-    )
-    values = (ip, field, start, end, methods_json, anomalies_json, composite_score, classification, report)
-    try:
-        if pymysql is None:
-            from django.db import connection
-            with connection.cursor() as cursor:
-                cursor.execute(insert_sql, values)
-                connection.commit()
-        else:
-            conn = pymysql.connect(host=config.DB_CONFIG['HOST'],
-                                   port=config.DB_CONFIG['PORT'],
-                                   user=config.DB_CONFIG['USER'],
-                                   password=config.DB_CONFIG['PASSWORD'],
-                                   database=config.DB_CONFIG['NAME'],
-                                   charset='utf8mb4')
-            cursor = conn.cursor()
-            cursor.execute(insert_sql, values)
-            conn.commit()
-            cursor.close()
-            conn.close()
-    except Exception as e:
-        print(f"保存记录失败: {e}")
-
 

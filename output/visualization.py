@@ -4,29 +4,133 @@ import uuid
 import os
 import time
 from datetime import datetime
-from typing import List, Dict, Tuple, Any, Optional
+from typing import List, Dict, Tuple, Any, Optional, Union
+from utils.time_utils import format_timestamp
 
-def generate_summary_echarts_html(series1, series2=None, detection_results=None, output_path=None, title="时序异常检测汇总图"):
-    """
-    生成融合所有方法的汇总异常检测可视化图表
+def process_anomaly_points(detection_results, series_data, timestamps):
     
-    参数:
-        series1: 第一个时序数据 [(timestamp, value), ...]
-        series2: 可选，第二个时序数据，用于多序列对比
-        detection_results: 多个检测器结果列表 [DetectionResult, ...]
-        output_path: 输出HTML文件路径
-        title: 图表标题
+    mark_points = []
+    tooltip_map = {}
+    point_counter = 1
     
-    返回:
-        output_path: 输出的HTML文件路径
-        tooltip_map: 异常点映射，用于报告中解释关联
-    """
-    if detection_results is None:
-        detection_results = []
+    for result in detection_results:
+        if not hasattr(result, 'visual_type') or result.visual_type != "point":
+            continue
+            
+        anomalies = result.anomalies if hasattr(result, 'anomalies') else []
+        explanations = result.explanation if hasattr(result, 'explanation') else []
         
-    chart_id = f"chart_summary_{uuid.uuid4().hex[:8]}"
+        for i, ts in enumerate(anomalies):
+            value = next((v for t, v in series_data if t == ts), None)
+            if value is None:
+                continue
 
-    # 主序列数据 - 修改名称和数据格式
+            explanation = ""
+            if i < len(explanations):
+                explanation = explanations[i]
+            
+            tooltip_map[point_counter] = {
+                "method": result.method if hasattr(result, 'method') else "未知方法",
+                "ts": ts,
+                "value": value,
+                "explanation": explanation
+            }
+            
+            mark_points.append({
+                "coord": [ts * 1000, value],
+                "symbol": "circle",
+                "symbolSize": 8,
+                "itemStyle": {"color": "red"},
+                "label": {"formatter": f"#{point_counter}", "show": True, "position": "top"},
+                "anomalyInfo": {
+                    "id": point_counter,
+                    "method": result.method if hasattr(result, 'method') else "未知方法",
+                    "timestamp": format_timestamp(ts),
+                    "value": value,
+                    "explanation": explanation
+                }
+            })
+            
+            point_counter += 1
+            
+    return mark_points, tooltip_map
+
+def process_anomaly_ranges(detection_results, timestamps):
+    
+    mark_areas = []
+    tooltip_map = {}
+    point_counter = 1
+    
+    for result in detection_results:
+        if not hasattr(result, 'visual_type') or result.visual_type not in ("range", "curve"):
+            continue
+            
+        intervals = result.intervals if hasattr(result, 'intervals') else []
+        explanations = result.explanation if hasattr(result, 'explanation') else []
+        
+        for i, (start, end) in enumerate(intervals):
+            area_explanation = ""
+            if i < len(explanations):
+                area_explanation = explanations[i]
+                
+            tooltip_map[point_counter] = {
+                "method": result.method if hasattr(result, 'method') else "未知方法",
+                "ts_start": start,
+                "ts_end": end,
+                "explanation": area_explanation
+            }
+            
+            mark_areas.append({
+                "itemStyle": {"color": "rgba(255, 100, 100, 0.2)"},
+                "label": {"show": True, "position": "top", "formatter": f"#{point_counter}"},
+                "xAxis": start * 1000,
+                "xAxis2": end * 1000,
+                "anomalyInfo": {
+                    "id": point_counter,
+                    "method": result.method if hasattr(result, 'method') else "未知方法",
+                    "startTime": format_timestamp(start),
+                    "endTime": format_timestamp(end),
+                    "explanation": area_explanation
+                }
+            })
+            
+            point_counter += 1
+            
+    return mark_areas, tooltip_map
+
+def process_auxiliary_curves(detection_results, timestamps):
+    #处理辅助曲线数据
+    
+    extra_series = []
+    for result in detection_results:
+        # 跳过非曲线类型或没有辅助曲线的结果
+        if not hasattr(result, 'visual_type') or result.visual_type != "curve":
+            continue
+        if not hasattr(result, 'auxiliary_curve') or not result.auxiliary_curve:
+            continue
+    
+        #是否使用第二个Y轴
+        use_second_yaxis = False
+        if hasattr(result, 'method'):
+            use_second_yaxis = result.method in ["CUSUM", "TrendDriftCUSUM"]
+            
+        yAxisIndex = 1 if use_second_yaxis else 0
+        curve_data = [[t * 1000, v] for t, v in result.auxiliary_curve]
+        
+        extra_series.append({
+            "name": f"{result.method if hasattr(result, 'method') else '辅助'} 辅助曲线",
+            "type": "line",
+            "yAxisIndex": yAxisIndex,
+            "data": curve_data,
+            "lineStyle": {"type": "dashed", "width": 1.5},
+            "itemStyle": {"color": "#EE6666"},
+            "showSymbol": False
+        })
+            
+    return extra_series
+
+def prepare_series_data(series1, series2=None):
+   
     series_list = [{
         "name": series2 is not None and "上周CPU利用率" or "原始序列",
         "type": "line",
@@ -35,22 +139,20 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
         "lineStyle": {"width": 2},
         "itemStyle": {"color": "#5470C6"}
     }]
-    
-    # 添加第二个序列（如果存在）
+
     if series2 is not None:
-        # 将两个序列的时间范围对齐
+        #时间范围对齐
         min_time = min(series1[0][0], series2[0][0])
-        offset1 = series1[0][0] - min_time  # 第一个序列相对于较早开始时间的偏移
-        offset2 = series2[0][0] - min_time  # 第二个序列相对于较早开始时间的偏移
+        offset1 = series1[0][0] - min_time 
+        offset2 = series2[0][0] - min_time
         
-        # 将时间戳调整为相对时间，这样两个序列可以在图表上对齐
         adjusted_series2 = [(t - offset2 + offset1, v) for t, v in series2]
         
         series_list.append({
             "name": "这周CPU利用率",
             "type": "line",
             "data": [[t * 1000, v] for t, v in adjusted_series2],
-            "symbolSize": 0,  # 减小正常点的大小
+            "symbolSize": 0,
             "lineStyle": {"width": 2},
             "itemStyle": {"color": "#91CC75"}
         })
@@ -66,116 +168,33 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
                 "name": "差值曲线",
                 "type": "line",
                 "data": diff_data,
-                "symbolSize": 0,  # 减小正常点的大小
+                "symbolSize": 0, 
                 "lineStyle": {"width": 1, "type": "dashed"},
                 "itemStyle": {"color": "#EE6666"}
             })
+    
+    return series_list
 
-    mark_points = []
-    mark_areas = []
-    extra_series = []
-    tooltip_map = {}
-
-    point_counter = 1  # 异常点序号
-    explanation_counter = 1  # 解释编号
-
-    for result in detection_results:
-        # 处理点异常
-        if result.visual_type == "point":
-            for i, ts in enumerate(result.anomalies):
-                value = next((v for t, v in series1 if t == ts), None)
-                if value is None:
-                    continue
-                
-                # 构建标签和提示信息
-                explanation = ""
-                if i < len(result.explanation):
-                    explanation = result.explanation[i]
-                
-                # 存储对应关系，用于报告生成
-                tooltip_map[point_counter] = {
-                    "method": result.method,
-                    "ts": ts,
-                    "value": value,
-                    "explanation": explanation
-                }
-                explanation_counter += 1
-                
-                # 添加标记点，将异常信息存储在数据中供自定义tooltip使用
-                mark_points.append({
-                    "coord": [ts * 1000, value],
-                    "symbol": "circle",
-                    "symbolSize": 8,
-                    "itemStyle": {"color": "red"},
-                    "label": {"formatter": f"#{point_counter}", "show": True, "position": "top"},
-                    "anomalyInfo": {
-                        "id": point_counter,
-                        "method": result.method,
-                        "timestamp": format_timestamp(ts),
-                        "value": value,
-                        "explanation": explanation
-                    }
-                })
-                point_counter += 1
-
-        # 处理区间异常
-        if result.visual_type in ("range", "curve"):
-            for i, (start, end) in enumerate(result.intervals):
-                # 获取区间解释
-                area_explanation = ""
-                if i < len(result.explanation):
-                    area_explanation = result.explanation[i]
-                
-                # 存储对应关系
-                tooltip_map[point_counter] = {
-                    "method": result.method,
-                    "ts_start": start,
-                    "ts_end": end,
-                    "explanation": area_explanation
-                }
-                
-                # 添加标记区域，将异常信息存储在数据中供自定义tooltip使用
-                mark_areas.append({
-                    "itemStyle": {"color": "rgba(255, 100, 100, 0.2)"},
-                    "label": {"show": True, "position": "top", "formatter": f"#{point_counter}"},
-                    "xAxis": start * 1000,
-                    "xAxis2": end * 1000,
-                    "anomalyInfo": {
-                        "id": point_counter,
-                        "method": result.method,
-                        "startTime": format_timestamp(start),
-                        "endTime": format_timestamp(end),
-                        "explanation": area_explanation
-                    }
-                })
-                
-                point_counter += 1
-                explanation_counter += 1
-
-        # 处理辅助曲线 - 使用第二个y轴
-        if result.visual_type == "curve" and result.auxiliary_curve:
-            # 检查方法名来确定是否使用第二个Y轴
-            use_second_yaxis = result.method in ["CUSUM", "TrendDriftCUSUM"]
-            yAxisIndex = 1 if use_second_yaxis else 0
-            
-            curve_data = [[t * 1000, v] for t, v in result.auxiliary_curve]
-            extra_series.append({
-                "name": f"{result.method} 辅助曲线",
-                "type": "line",
-                "yAxisIndex": yAxisIndex,  # 使用右侧Y轴
-                "data": curve_data,
-                "lineStyle": {"type": "dashed", "width": 1.5},
-                "itemStyle": {"color": "#EE6666"},
-                "showSymbol": False
-            })
-
-    # 合并所有系列
+def generate_summary_echarts_html(series1, series2=None, detection_results=None, output_path=None, title="时序异常检测汇总图"):
+    
+    if detection_results is None:
+        detection_results = []
+        
+    chart_id = f"chart_summary_{uuid.uuid4().hex[:8]}"
+    timestamps = [t for t, _ in series1]
+    
+    series_list = prepare_series_data(series1, series2)
+    
+    mark_points, tooltip_map_points = process_anomaly_points(detection_results, series1, timestamps)
+    mark_areas, tooltip_map_areas = process_anomaly_ranges(detection_results, timestamps)
+    extra_series = process_auxiliary_curves(detection_results, timestamps)
+    
     series_list.extend(extra_series)
     
-    # 检查是否需要第二个Y轴
+    tooltip_map = {**tooltip_map_points, **tooltip_map_areas}
+    
     need_second_yaxis = any(s.get("yAxisIndex", 0) == 1 for s in series_list)
 
-    # 构建 ECharts 选项
     option = {
         "title": {"text": title, "left": "center"},
         "tooltip": {
@@ -204,8 +223,8 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
             "name": "时间",
             "axisLabel": {
                 "formatter": "{yyyy}-{MM}-{dd} {HH}:{mm}",
-                "rotate": 30,  # 旋转标签以避免重叠
-                "margin": 15   # 增加边距
+                "rotate": 30,
+                "margin": 15
             }
         },
         "yAxis": [
@@ -218,7 +237,6 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
         ]
     }
     
-    # 添加第二个Y轴（如果需要）
     if need_second_yaxis:
         option["yAxis"].append({
             "type": "value",
@@ -227,7 +245,6 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
             "splitLine": {"show": False}
         })
 
-    # 整合标记点和标记区域
     if mark_points:
         series_list[0]["markPoint"] = {
             "data": mark_points, 
@@ -243,8 +260,19 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
             "emphasis": {"focus": "self"}
         }
 
-    # 生成HTML，添加自定义JavaScript处理异常点的tooltip
-    html = f"""<!DOCTYPE html>
+    #异常点的tooltip
+    html = generate_html_template(chart_id, option, title)
+
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        return output_path, tooltip_map
+    else:
+        return html, tooltip_map
+
+def generate_html_template(chart_id, option, title):
+    return f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -255,7 +283,7 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
         #container {{ width: 100%; height: 100vh; }}
         #{chart_id} {{ width: 100%; height: 650px; }}
         
-        /* 自定义异常点提示样式 */
+        /* 异常点提示样式 */
         .anomaly-tooltip {{
             background-color: rgba(255, 255, 255, 0.9);
             border: 1px solid #ccc;
@@ -295,7 +323,6 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
         var chart = echarts.init(document.getElementById('{chart_id}'));
         var option = {json.dumps(option, ensure_ascii=False)};
         
-        // 自定义tooltip处理函数
         chart.on('mouseover', function(params) {{
             if (params.componentType === 'markPoint' && params.data && params.data.anomalyInfo) {{
                 var info = params.data.anomalyInfo;
@@ -337,7 +364,7 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
         
         chart.on('mouseout', function(params) {{
             if (params.componentType === 'markPoint' || params.componentType === 'markArea') {{
-                // 恢复默认tooltip
+                //恢复默认tooltip
                 chart.setOption({{
                     tooltip: {{
                         formatter: null,
@@ -354,71 +381,3 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
     </script>
 </body>
 </html>"""
-
-    # 确保输出目录存在
-    if output_path:
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        # 写入文件
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(html)
-        return output_path, tooltip_map
-    else:
-        return html, tooltip_map
-
-def format_timestamp(ts):
-    """将时间戳格式化为可读时间"""
-    from datetime import datetime
-    try:
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-    except:
-        return str(ts)
-
-# 向后兼容函数
-def generate_echarts_html_single(series, anomalies, title="单序列异常检测"):
-    """
-    向后兼容函数 - 生成单序列异常检测图表
-    """
-    from detectors.base import DetectionResult
-    import time
-    
-    # 将旧格式转换为检测结果对象
-    result = DetectionResult(
-        method="Legacy",
-        anomalies=anomalies,
-        description="旧版接口生成的异常检测图表",
-        visual_type="point"
-    )
-    
-    path = f"output/plots/legacy_single_{int(time.time())}.html"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    
-    chart_path, _ = generate_summary_echarts_html(
-        series, None, [result], path, title
-    )
-    
-    return chart_path
-
-def generate_echarts_html_multi(series1, series2, anomalies, title="多序列对比异常检测"):
-    """
-    向后兼容函数 - 生成多序列对比异常检测图表
-    """
-    from detectors.base import DetectionResult
-    import time
-    
-    # 将旧格式转换为检测结果对象
-    result = DetectionResult(
-        method="Legacy",
-        anomalies=anomalies,
-        description="旧版接口生成的异常检测图表",
-        visual_type="point"
-    )
-    
-    path = f"output/plots/legacy_multi_{int(time.time())}.html"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    
-    chart_path, _ = generate_summary_echarts_html(
-        series1, series2, [result], path, title
-    )
-    
-    return chart_path
