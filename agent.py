@@ -11,7 +11,7 @@ import config
 import dateparser
 from django.conf import settings
 
-
+from output.report_generator import get_anomaly_detection_report
 from analysis.single_series import analyze_single_series
 from analysis.multi_series import analyze_multi_series
 from output.report_generator import generate_report_single, generate_report_multi
@@ -331,56 +331,111 @@ def get_service_asset_edges(service, instance_ip):
     else:
         return f"查询拓扑失败: {resp.status_code} => {resp.text}"
     
-def get_monitor_metric_value(ip, start, end, field):
-    import datetime
-    def to_int(s):
-        dt = datetime.datetime.strptime(s,"%Y-%m-%d %H:%M:%S")
-        return int(dt.timestamp())
-    st_i = to_int(start)
-    et_i = to_int(end)
-    fpath= _cache_filename(ip, st_i, et_i, field)
-    if os.path.exists(fpath):
-        print("(已从本地缓存读取)")
-        return json.load(open(fpath,"r",encoding="utf-8"))
-    else:
-        data= fetch_data_from_backend(ip, st_i, et_i, field)
-        if isinstance(data,str):
-            return data
-        with open(fpath,"w",encoding="utf-8") as f:
-            json.dump(data,f,ensure_ascii=False,indent=2)
-        print("(已调用后端并写入本地缓存)")
-        return data
+def get_series_data(ip: str, start: str, end: str, field: str):
+    """
+    封装数据拉取流程：缓存检查 + 加载数据
+    返回值: list 或 str（错误信息）
+    """
+    fpath = ensure_cache_file(ip, start, end, field)
+    if isinstance(fpath, str) and not os.path.exists(fpath):
+        return fpath  # 返回错误字符串
+    return load_series_from_cachefile(fpath)
+
+def validate_multi_series_params(action_input):
+    """
+    验证多序列对比异常检测的参数
+    
+    参数:
+        action_input: 动作输入参数
+        
+    返回:
+        bool: 参数是否有效
+    """
+    # 识别序列编号
+    sequence_nums = set()
+    for key in action_input.keys():
+        if key.startswith(('ip', 'field', 'start', 'end')) and len(key) > 2 and key[2:].isdigit():
+            sequence_nums.add(int(key[2:]))
+    
+    # 检查序列数量
+    if len(sequence_nums) > 2 or max(sequence_nums, default=0) > 2:
+        return False
+    
+    # 检查必要参数
+    required_pairs = [
+        ('ip1', 'field1', 'start1', 'end1'),
+        ('ip2', 'field2', 'start2', 'end2')
+    ]
+    
+    for pair in required_pairs:
+        if not all(param in action_input for param in pair):
+            return False
+            
+    return True
 
 ###############################################################################
-def single_series_detect(ip, field, start, end):
+def single_series_detect(ip, field, start, end, user_query=""):
+    """
+    进行单序列异常检测
+    
+    参数:
+        ip: 主机IP
+        field: 指标字段
+        start: 开始时间
+        end: 结束时间
+        user_query: 用户原始查询
+        
+    返回:
+        dict: 分析结果
+    """
+    # 确保缓存文件存在
     fpath = ensure_cache_file(ip, start, end, field)
     if isinstance(fpath, str) and not os.path.exists(fpath):
         return {"error": fpath}  
 
+    # 加载时序数据
     if os.path.exists(fpath):
         series = load_series_from_cachefile(fpath)
         if series is None:
             return {"error": f"无法加载缓存文件: {fpath}"}
 
         try:
-            user_query = f"分析 {ip} 在 {start} ~ {end} 的 {field} 数据"
-            result = generate_report_single(series, ip, field, user_query)
+            # 设置默认用户查询文本
+            query_text = user_query or f"分析 {ip} 在 {start} ~ {end} 的 {field} 数据"
+            
+            # 生成报告
+            result = generate_report_single(series, ip, field, query_text)
+            result["user_query"] = query_text
             return result
         except Exception as e:
             print(f"单序列分析生成报告失败: {e}")
-            traceback.print_exc()  # 打印详细错误
-            # 通过旧方法返回基本结果
+            traceback.print_exc()
+            
+            # 使用基本分析作为备选
             analysis_result = analyze_single_series(series)
             return {
                 "classification": analysis_result["classification"],
                 "composite_score": analysis_result["composite_score"],
                 "anomaly_times": analysis_result["anomaly_times"],
-                "report_path": "N/A - 报告生成失败"
+                "report_path": "N/A - 报告生成失败",
+                "user_query": query_text
             }
 
     return {"error": fpath}
 
-def multi_series_detect(ip1, field1, start1, end1, ip2, field2, start2, end2):
+def multi_series_detect(ip1, field1, start1, end1, ip2, field2, start2, end2, user_query=""):
+    """
+    进行多序列对比异常检测
+    
+    参数:
+        ip1, field1, start1, end1: 第一个序列的参数
+        ip2, field2, start2, end2: 第二个序列的参数
+        user_query: 用户原始查询
+        
+    返回:
+        dict: 分析结果
+    """
+    # 确保两个时序数据的缓存文件存在
     fpath1 = ensure_cache_file(ip1, start1, end1, field1)
     fpath2 = ensure_cache_file(ip2, start2, end2, field2)
     
@@ -389,26 +444,33 @@ def multi_series_detect(ip1, field1, start1, end1, ip2, field2, start2, end2):
     if isinstance(fpath2, str) and not os.path.exists(fpath2):
         return {"error": fpath2}
 
+    # 加载时序数据
     series1 = load_series_from_cachefile(fpath1)
     series2 = load_series_from_cachefile(fpath2)
     if series1 is None or series2 is None:
         return {"error": f"无法加载本地缓存文件: {fpath1} / {fpath2}"}
 
     try:
-        user_query = f"对比分析 {ip1} 在 {start1} 和 {start2} 的 {field1} 指标"
-        result = generate_report_multi(series1, series2, ip1, ip2, field1, user_query)
+        # 设置默认用户查询文本
+        query_text = user_query or f"对比分析 {ip1} 在 {start1} 和 {start2} 的 {field1} 指标"
+        
+        # 生成多序列对比报告
+        result = generate_report_multi(series1, series2, ip1, ip2, field1, query_text)
+        result["user_query"] = query_text
         return result
     except Exception as e:
         print(f"多序列分析生成报告失败: {e}")
-        traceback.print_exc()  # 打印详细错误
-        # 通过旧方法返回基本结果
+        traceback.print_exc()
+        
+        # 使用基本分析作为备选
         analysis_result = analyze_multi_series(series1, series2)
         return {
             "classification": analysis_result["classification"],
             "composite_score": analysis_result["composite_score"],
             "anomaly_times": analysis_result["anomaly_times"],
             "anomaly_intervals": analysis_result.get("anomaly_intervals", []),
-            "report_path": "N/A - 报告生成失败"
+            "report_path": "N/A - 报告生成失败",
+            "user_query": query_text
         }
 
 ###############################################################################
@@ -429,10 +491,6 @@ def llm_call(messages):
     else:
         print("Error:", r.status_code, r.text)
         return None
-    
-def init_msg(role, content):
-    return {"role": role, "content": content}
-
 
 def parse_llm_response(txt):
     pat_thought = r"<思考过程>(.*?)</思考过程>"
@@ -470,7 +528,8 @@ def react(llm_text):
         if action == "解析用户自然语言时间":
             return parse_time_expressions(action_input["raw_text"]), False
         if action == "请求智能运管后端Api，获取指标项的时序数据":
-            return get_monitor_metric_value(**action_input), False
+            data = get_series_data(**action_input)
+            return data, False
         if action == "请求智能运管后端Api，查询监控实例有哪些监控项":
             return monitor_item_list(action_input["instance"]), False
         elif action == "请求智能运管后端Api，查询监控服务的资产情况和监控实例":
@@ -478,69 +537,28 @@ def react(llm_text):
         elif action == "请求智能运管后端Api，查询监控实例之间的拓扑关联关系":
             return get_service_asset_edges(action_input["service"], action_input["instance_ip"]), False
         
-        
-        if action == "单序列异常检测(文件)":
+        elif action == "单序列异常检测(文件)":
+            # 调用单序列异常检测函数
             result = single_series_detect(**action_input)
             if "error" in result:
                 return result["error"], False
 
-            rep = result
-            # 添加文字分析报告
-            analysis_text = rep.get("analysis_text", "")
-    
-            final_answer = f"""
-## 单序列异常检测报告
-
-**结论**：{rep['classification']}  
-**得分**：{rep['composite_score']:.2f}  
-**异常点数**：{len(rep['anomaly_times'])}
-
-{analysis_text}
-
-**图表路径**：{rep['report_path']}
-"""
-            return final_answer, False
-
+            # 处理结果并生成报告
+            report = get_anomaly_detection_report(result, "single")
+            return report, False
         elif action == "多序列对比异常检测(文件)":
-            
-            sequence_nums = set()
-            for key in action_input.keys():
-                if key.startswith(('ip', 'field', 'start', 'end')) and len(key) > 2 and key[2:].isdigit():
-                    sequence_nums.add(int(key[2:]))
-            
-            if len(sequence_nums) > 2 or max(sequence_nums, default=0) > 2:
-                return "多序列对比异常检测工具目前一次只能对比两个序列。请先指定要对比的两个序列，之后可以进行其他序列的对比。", False
-            
-            required_pairs = [
-                ('ip1', 'field1', 'start1', 'end1'),
-                ('ip2', 'field2', 'start2', 'end2')
-            ]
-            
-            for pair in required_pairs:
-                if not all(param in action_input for param in pair):
-                    missing = [param for param in pair if param not in action_input]
-                    return f"缺少必要参数: {', '.join(missing)}", False
-
+            # 参数验证
+            if not validate_multi_series_params(action_input):
+                return "参数验证失败，请确保提供了两组完整的序列信息", False
+                
+            # 调用多序列异常检测函数
             result = multi_series_detect(**action_input)
             if "error" in result:
                 return result["error"], False
 
-            rep = result
-            # 添加文字分析报告到返回结果
-            analysis_text = rep.get("analysis_text", "")
-    
-            final_answer = f"""
-## 多序列对比异常检测报告
-
-**结论**：{rep['classification']}  
-**综合得分**：{rep['composite_score']:.2f}  
-**异常段数**：{len(rep.get('anomaly_intervals', []))}
-
-{analysis_text}
-
-**图表路径**：{rep['report_path']}
-"""
-            return final_answer, False
+            # 处理结果并生成报告
+            report = get_anomaly_detection_report(result, "multi")
+            return report, False
         else:
             return f"未知工具调用: {action}", False
         
@@ -637,6 +655,8 @@ def chat(user_query):
     max_round=15
     pending_context = None 
     had_supplement = False
+    # 保存原始用户查询，用于生成报告
+    original_user_query = user_query
 
     while True:
         print(f"=== 第{round_num}轮对话 ===")
@@ -651,11 +671,10 @@ def chat(user_query):
             print("大模型返回None,结束")
             return
 
-        #print("## 大模型完整响应:", ans)
         print(ans["content"])
 
         history.append(ans)
-        txt= ans.get("content","")
+        txt = ans.get("content","")
         res = react(txt)
 
         if isinstance(res, dict) and res.get("type") == "supplement":
@@ -671,6 +690,24 @@ def chat(user_query):
 
         result, done = res
         
+        # 为异常检测工具调用添加原始用户查询
+        if any(action in txt for action in ["单序列异常检测(文件)", "多序列对比异常检测(文件)"]):
+            # 从文本中提取action_input
+            try:
+                action_input_match = re.search(r'<调用参数>(.*?)</调用参数>', txt, re.DOTALL)
+                if action_input_match:
+                    action_input = json.loads(action_input_match.group(1))
+                    # 添加用户查询
+                    action_input["user_query"] = original_user_query
+                    # 更新调用参数
+                    updated_txt = re.sub(r'<调用参数>.*?</调用参数>', 
+                                         f'<调用参数>{json.dumps(action_input, ensure_ascii=False)}</调用参数>', 
+                                         txt, flags=re.DOTALL)
+                    # 更新历史记录中的最后一条消息
+                    history[-1]["content"] = updated_txt
+            except Exception as e:
+                print(f"处理调用参数出错: {str(e)}")  # 添加错误日志
+        
         short_result = shorten_tool_result(result)
         history.append({
             "role":"user",
@@ -680,14 +717,12 @@ def chat(user_query):
         if done:
             print("===最终输出===")
             print(result)
-            return
+            return result
 
         round_num+=1
         if round_num>max_round:
             print("超出上限")
             return
-
-
 
 if __name__ == '__main__':
     # chat('你好')

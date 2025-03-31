@@ -4,11 +4,23 @@ import sys
 import agent
 
 def main():
-    if len(sys.argv) > 1:
-        query = " ".join(sys.argv[1:])
-    else:
-        query = input("请输入查询: ")
-    agent.chat(query)
+    last_results = {}  # 用于存储最近一次的分析结果
+    
+    while True:
+        user_query = input("请输入查询 (输入'退出'结束): ")
+        if user_query.lower() in ["退出", "exit", "quit", "q"]:
+            print("谢谢使用，再见！")
+            break
+            
+        # 如果查询中包含"上次"或"之前"等词，可以传递上下文
+        if "上次" in user_query or "之前" in user_query or "刚才" in user_query:
+            # 可以在这里添加上下文处理逻辑
+            pass
+            
+        result = agent.chat(user_query)
+        last_results = result  # 存储结果供后续使用
+        
+        print("\n是否有其他问题？")
 
 if __name__ == '__main__':
     main()
@@ -28,7 +40,7 @@ import config
 import dateparser
 from django.conf import settings
 
-
+from output.report_generator import get_anomaly_detection_report
 from analysis.single_series import analyze_single_series
 from analysis.multi_series import analyze_multi_series
 from output.report_generator import generate_report_single, generate_report_multi
@@ -348,56 +360,111 @@ def get_service_asset_edges(service, instance_ip):
     else:
         return f"查询拓扑失败: {resp.status_code} => {resp.text}"
     
-def get_monitor_metric_value(ip, start, end, field):
-    import datetime
-    def to_int(s):
-        dt = datetime.datetime.strptime(s,"%Y-%m-%d %H:%M:%S")
-        return int(dt.timestamp())
-    st_i = to_int(start)
-    et_i = to_int(end)
-    fpath= _cache_filename(ip, st_i, et_i, field)
-    if os.path.exists(fpath):
-        print("(已从本地缓存读取)")
-        return json.load(open(fpath,"r",encoding="utf-8"))
-    else:
-        data= fetch_data_from_backend(ip, st_i, et_i, field)
-        if isinstance(data,str):
-            return data
-        with open(fpath,"w",encoding="utf-8") as f:
-            json.dump(data,f,ensure_ascii=False,indent=2)
-        print("(已调用后端并写入本地缓存)")
-        return data
+def get_series_data(ip: str, start: str, end: str, field: str):
+    """
+    封装数据拉取流程：缓存检查 + 加载数据
+    返回值: list 或 str（错误信息）
+    """
+    fpath = ensure_cache_file(ip, start, end, field)
+    if isinstance(fpath, str) and not os.path.exists(fpath):
+        return fpath  # 返回错误字符串
+    return load_series_from_cachefile(fpath)
+
+def validate_multi_series_params(action_input):
+    """
+    验证多序列对比异常检测的参数
+    
+    参数:
+        action_input: 动作输入参数
+        
+    返回:
+        bool: 参数是否有效
+    """
+    # 识别序列编号
+    sequence_nums = set()
+    for key in action_input.keys():
+        if key.startswith(('ip', 'field', 'start', 'end')) and len(key) > 2 and key[2:].isdigit():
+            sequence_nums.add(int(key[2:]))
+    
+    # 检查序列数量
+    if len(sequence_nums) > 2 or max(sequence_nums, default=0) > 2:
+        return False
+    
+    # 检查必要参数
+    required_pairs = [
+        ('ip1', 'field1', 'start1', 'end1'),
+        ('ip2', 'field2', 'start2', 'end2')
+    ]
+    
+    for pair in required_pairs:
+        if not all(param in action_input for param in pair):
+            return False
+            
+    return True
 
 ###############################################################################
-def single_series_detect(ip, field, start, end):
+def single_series_detect(ip, field, start, end, user_query=""):
+    """
+    进行单序列异常检测
+    
+    参数:
+        ip: 主机IP
+        field: 指标字段
+        start: 开始时间
+        end: 结束时间
+        user_query: 用户原始查询
+        
+    返回:
+        dict: 分析结果
+    """
+    # 确保缓存文件存在
     fpath = ensure_cache_file(ip, start, end, field)
     if isinstance(fpath, str) and not os.path.exists(fpath):
         return {"error": fpath}  
 
+    # 加载时序数据
     if os.path.exists(fpath):
         series = load_series_from_cachefile(fpath)
         if series is None:
             return {"error": f"无法加载缓存文件: {fpath}"}
 
         try:
-            user_query = f"分析 {ip} 在 {start} ~ {end} 的 {field} 数据"
-            result = generate_report_single(series, ip, field, user_query)
+            # 设置默认用户查询文本
+            query_text = user_query or f"分析 {ip} 在 {start} ~ {end} 的 {field} 数据"
+            
+            # 生成报告
+            result = generate_report_single(series, ip, field, query_text)
+            result["user_query"] = query_text
             return result
         except Exception as e:
             print(f"单序列分析生成报告失败: {e}")
-            traceback.print_exc()  # 打印详细错误
-            # 通过旧方法返回基本结果
+            traceback.print_exc()
+            
+            # 使用基本分析作为备选
             analysis_result = analyze_single_series(series)
             return {
                 "classification": analysis_result["classification"],
                 "composite_score": analysis_result["composite_score"],
                 "anomaly_times": analysis_result["anomaly_times"],
-                "report_path": "N/A - 报告生成失败"
+                "report_path": "N/A - 报告生成失败",
+                "user_query": query_text
             }
 
     return {"error": fpath}
 
-def multi_series_detect(ip1, field1, start1, end1, ip2, field2, start2, end2):
+def multi_series_detect(ip1, field1, start1, end1, ip2, field2, start2, end2, user_query=""):
+    """
+    进行多序列对比异常检测
+    
+    参数:
+        ip1, field1, start1, end1: 第一个序列的参数
+        ip2, field2, start2, end2: 第二个序列的参数
+        user_query: 用户原始查询
+        
+    返回:
+        dict: 分析结果
+    """
+    # 确保两个时序数据的缓存文件存在
     fpath1 = ensure_cache_file(ip1, start1, end1, field1)
     fpath2 = ensure_cache_file(ip2, start2, end2, field2)
     
@@ -406,26 +473,33 @@ def multi_series_detect(ip1, field1, start1, end1, ip2, field2, start2, end2):
     if isinstance(fpath2, str) and not os.path.exists(fpath2):
         return {"error": fpath2}
 
+    # 加载时序数据
     series1 = load_series_from_cachefile(fpath1)
     series2 = load_series_from_cachefile(fpath2)
     if series1 is None or series2 is None:
         return {"error": f"无法加载本地缓存文件: {fpath1} / {fpath2}"}
 
     try:
-        user_query = f"对比分析 {ip1} 在 {start1} 和 {start2} 的 {field1} 指标"
-        result = generate_report_multi(series1, series2, ip1, ip2, field1, user_query)
+        # 设置默认用户查询文本
+        query_text = user_query or f"对比分析 {ip1} 在 {start1} 和 {start2} 的 {field1} 指标"
+        
+        # 生成多序列对比报告
+        result = generate_report_multi(series1, series2, ip1, ip2, field1, query_text)
+        result["user_query"] = query_text
         return result
     except Exception as e:
         print(f"多序列分析生成报告失败: {e}")
-        traceback.print_exc()  # 打印详细错误
-        # 通过旧方法返回基本结果
+        traceback.print_exc()
+        
+        # 使用基本分析作为备选
         analysis_result = analyze_multi_series(series1, series2)
         return {
             "classification": analysis_result["classification"],
             "composite_score": analysis_result["composite_score"],
             "anomaly_times": analysis_result["anomaly_times"],
             "anomaly_intervals": analysis_result.get("anomaly_intervals", []),
-            "report_path": "N/A - 报告生成失败"
+            "report_path": "N/A - 报告生成失败",
+            "user_query": query_text
         }
 
 ###############################################################################
@@ -446,10 +520,6 @@ def llm_call(messages):
     else:
         print("Error:", r.status_code, r.text)
         return None
-    
-def init_msg(role, content):
-    return {"role": role, "content": content}
-
 
 def parse_llm_response(txt):
     pat_thought = r"<思考过程>(.*?)</思考过程>"
@@ -487,7 +557,8 @@ def react(llm_text):
         if action == "解析用户自然语言时间":
             return parse_time_expressions(action_input["raw_text"]), False
         if action == "请求智能运管后端Api，获取指标项的时序数据":
-            return get_monitor_metric_value(**action_input), False
+            data = get_series_data(**action_input)
+            return data, False
         if action == "请求智能运管后端Api，查询监控实例有哪些监控项":
             return monitor_item_list(action_input["instance"]), False
         elif action == "请求智能运管后端Api，查询监控服务的资产情况和监控实例":
@@ -495,69 +566,28 @@ def react(llm_text):
         elif action == "请求智能运管后端Api，查询监控实例之间的拓扑关联关系":
             return get_service_asset_edges(action_input["service"], action_input["instance_ip"]), False
         
-        
-        if action == "单序列异常检测(文件)":
+        elif action == "单序列异常检测(文件)":
+            # 调用单序列异常检测函数
             result = single_series_detect(**action_input)
             if "error" in result:
                 return result["error"], False
 
-            rep = result
-            # 添加文字分析报告
-            analysis_text = rep.get("analysis_text", "")
-    
-            final_answer = f"""
-## 单序列异常检测报告
-
-**结论**：{rep['classification']}  
-**得分**：{rep['composite_score']:.2f}  
-**异常点数**：{len(rep['anomaly_times'])}
-
-{analysis_text}
-
-**图表路径**：{rep['report_path']}
-"""
-            return final_answer, False
-
+            # 处理结果并生成报告
+            report = get_anomaly_detection_report(result, "single")
+            return report, False
         elif action == "多序列对比异常检测(文件)":
-            
-            sequence_nums = set()
-            for key in action_input.keys():
-                if key.startswith(('ip', 'field', 'start', 'end')) and len(key) > 2 and key[2:].isdigit():
-                    sequence_nums.add(int(key[2:]))
-            
-            if len(sequence_nums) > 2 or max(sequence_nums, default=0) > 2:
-                return "多序列对比异常检测工具目前一次只能对比两个序列。请先指定要对比的两个序列，之后可以进行其他序列的对比。", False
-            
-            required_pairs = [
-                ('ip1', 'field1', 'start1', 'end1'),
-                ('ip2', 'field2', 'start2', 'end2')
-            ]
-            
-            for pair in required_pairs:
-                if not all(param in action_input for param in pair):
-                    missing = [param for param in pair if param not in action_input]
-                    return f"缺少必要参数: {', '.join(missing)}", False
-
+            # 参数验证
+            if not validate_multi_series_params(action_input):
+                return "参数验证失败，请确保提供了两组完整的序列信息", False
+                
+            # 调用多序列异常检测函数
             result = multi_series_detect(**action_input)
             if "error" in result:
                 return result["error"], False
 
-            rep = result
-            # 添加文字分析报告到返回结果
-            analysis_text = rep.get("analysis_text", "")
-    
-            final_answer = f"""
-## 多序列对比异常检测报告
-
-**结论**：{rep['classification']}  
-**综合得分**：{rep['composite_score']:.2f}  
-**异常段数**：{len(rep.get('anomaly_intervals', []))}
-
-{analysis_text}
-
-**图表路径**：{rep['report_path']}
-"""
-            return final_answer, False
+            # 处理结果并生成报告
+            report = get_anomaly_detection_report(result, "multi")
+            return report, False
         else:
             return f"未知工具调用: {action}", False
         
@@ -654,6 +684,8 @@ def chat(user_query):
     max_round=15
     pending_context = None 
     had_supplement = False
+    # 保存原始用户查询，用于生成报告
+    original_user_query = user_query
 
     while True:
         print(f"=== 第{round_num}轮对话 ===")
@@ -668,11 +700,10 @@ def chat(user_query):
             print("大模型返回None,结束")
             return
 
-        #print("## 大模型完整响应:", ans)
         print(ans["content"])
 
         history.append(ans)
-        txt= ans.get("content","")
+        txt = ans.get("content","")
         res = react(txt)
 
         if isinstance(res, dict) and res.get("type") == "supplement":
@@ -688,6 +719,24 @@ def chat(user_query):
 
         result, done = res
         
+        # 为异常检测工具调用添加原始用户查询
+        if any(action in txt for action in ["单序列异常检测(文件)", "多序列对比异常检测(文件)"]):
+            # 从文本中提取action_input
+            try:
+                action_input_match = re.search(r'<调用参数>(.*?)</调用参数>', txt, re.DOTALL)
+                if action_input_match:
+                    action_input = json.loads(action_input_match.group(1))
+                    # 添加用户查询
+                    action_input["user_query"] = original_user_query
+                    # 更新调用参数
+                    updated_txt = re.sub(r'<调用参数>.*?</调用参数>', 
+                                         f'<调用参数>{json.dumps(action_input, ensure_ascii=False)}</调用参数>', 
+                                         txt, flags=re.DOTALL)
+                    # 更新历史记录中的最后一条消息
+                    history[-1]["content"] = updated_txt
+            except Exception as e:
+                print(f"处理调用参数出错: {str(e)}")  # 添加错误日志
+        
         short_result = shorten_tool_result(result)
         history.append({
             "role":"user",
@@ -697,14 +746,12 @@ def chat(user_query):
         if done:
             print("===最终输出===")
             print(result)
-            return
+            return result
 
         round_num+=1
         if round_num>max_round:
             print("超出上限")
             return
-
-
 
 if __name__ == '__main__':
     # chat('你好')
@@ -1012,140 +1059,198 @@ from typing import List, Dict, Any, Optional
 import config
 from output.visualization import generate_summary_echarts_html
 
-def generate_text_analysis(detection_results, composite_score, classification, series_info, is_multi_series=False):
+def convert_markdown_to_html(markdown_text):
     """
-    生成易于理解的文字分析报告
+    将Markdown文本转换为HTML
     
     参数:
-        detection_results: 检测结果列表
-        composite_score: 综合得分
-        classification: 分类结果 ('正常', '轻度异常', '高置信度异常')
-        series_info: 关于数据的信息 {"ip": str, "field": str, "start": str, "end": str}
-        is_multi_series: 是否是多序列分析
+        markdown_text: Markdown格式的文本
+    
+    返回:
+        str: 转换后的HTML文本
+    """
+    # 转换标题
+    html = markdown_text
+    
+    # 转换## 标题
+    html = re.sub(r'^## (.*?)$', r'<h2>\1</h2>', html, flags=re.MULTILINE)
+    
+    # 转换### 标题
+    html = re.sub(r'^### (.*?)$', r'<h3>\1</h3>', html, flags=re.MULTILINE)
+    
+    # 转换#### 标题
+    html = re.sub(r'^#### (.*?)$', r'<h4>\1</h4>', html, flags=re.MULTILINE)
+    
+    # 转换# 标题
+    html = re.sub(r'^# (.*?)$', r'<h1>\1</h1>', html, flags=re.MULTILINE)
+    
+    # 转换加粗
+    html = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', html)
+    
+    # 转换斜体
+    html = re.sub(r'\*(.*?)\*', r'<em>\1</em>', html)
+    
+    # 转换无序列表
+    # 先把所有无序列表项转换为临时标记
+    html = re.sub(r'^- (.*?)$', r'<li>\1</li>', html, flags=re.MULTILINE)
+    
+    # 将连续的<li>项组合成<ul>列表
+    li_pattern = r'(<li>.*?</li>)+'
+    
+    def replace_list(match):
+        list_items = match.group(0)
+        return f'<ul>{list_items}</ul>'
+    
+    html = re.sub(li_pattern, replace_list, html, flags=re.DOTALL)
+    
+    # 转换有序列表 (数字后跟点的格式)
+    html = re.sub(r'^(\d+)\. (.*?)$', r'<li>\2</li>', html, flags=re.MULTILINE)
+    
+    # 转换段落 (连续的非标签文本)
+    # 先按换行符分割
+    paragraphs = []
+    buffer = ""
+    
+    for line in html.split('\n'):
+        line = line.strip()
+        if line and not line.startswith('<') and not line.endswith('>'):
+            if buffer:
+                buffer += " " + line
+            else:
+                buffer = line
+        else:
+            if buffer:
+                paragraphs.append(f'<p>{buffer}</p>')
+                buffer = ""
+            if line:
+                paragraphs.append(line)
+    
+    if buffer:
+        paragraphs.append(f'<p>{buffer}</p>')
+    
+    html = '\n'.join(paragraphs)
+    
+    return html
+
+def generate_llm_report(result, report_type="single", user_query=""):
+    """
+    使用大模型生成异常检测分析报告
+    
+    参数:
+        result: 异常检测结果
+        report_type: 报告类型，"single"单序列或"multi"多序列
+        user_query: 用户的原始查询
         
     返回:
-        str: 结构化的文字分析报告
+        str: 大模型生成的分析报告
     """
-    # 提取基本信息
-    ip = series_info.get("ip", "未知主机")
-    field = series_info.get("field", "未知指标")
-    start_time = series_info.get("start", "未知开始时间")
-    end_time = series_info.get("end", "未知结束时间")
+    # 构建完整的上下文信息
+    classification = result.get('classification', '未知')
+    score = result.get('composite_score', 0)
     
-    # 检测统计信息
-    total_anomalies = sum(len(result.anomalies) for result in detection_results)
-    total_intervals = sum(len(result.intervals) for result in detection_results)
-    methods_with_anomalies = [r.method for r in detection_results if len(r.anomalies) > 0 or len(r.intervals) > 0]
+    # 获取异常点数量
+    anomaly_count = len(result.get('anomaly_times', []))
+    interval_count = len(result.get('anomaly_intervals', []))
     
-    # 格式化时间
+    # 提取方法结果信息
+    method_results = result.get('method_results', [])
+    method_details = []
+    
+    for method in method_results:
+        if isinstance(method, dict):
+            # 如果已经是字典形式
+            method_info = method
+        else:
+            # 如果是对象，转为字典
+            method_info = method.to_dict() if hasattr(method, 'to_dict') else vars(method)
+        
+        # 提取关键信息
+        method_name = method_info.get('method', '未知方法')
+        anomalies = method_info.get('anomalies', [])
+        intervals = method_info.get('intervals', [])
+        explanations = method_info.get('explanation', [])
+        
+        if anomalies or intervals or explanations:
+            detail = {
+                "method": method_name,
+                "anomaly_count": len(anomalies),
+                "interval_count": len(intervals),
+                "explanations": explanations[:3]  # 限制长度
+            }
+            method_details.append(detail)
+    
+    # 构建提示文本
+    if report_type == "single":
+        prompt = f"""
+请为以下单序列异常检测结果生成一份详细的分析报告，报告应包含以下方面：
+1. 总体异常状况摘要
+2. 各检测方法发现的问题分析
+3. 可能的原因分析
+4. 建议的后续操作
+
+检测结果信息：
+- 用户查询: {user_query}
+- 总体分类: {classification}
+- 综合得分: {score:.2f}
+- 发现异常点数: {anomaly_count}
+
+检测方法详情:
+{json.dumps(method_details, ensure_ascii=False, indent=2)}
+
+请注意以下要求：
+- 生成的报告应该使用Markdown格式，包含标题(##)、子标题(###)、列表项等
+- 每个部分应该使用二级标题(##)，内容要精炼但信息量丰富
+- 不要简单重复上述数据，而是提供有价值的见解和分析
+- 总长度控制在600字以内
+"""
+    else:  # multi
+        prompt = f"""
+请为以下多序列对比异常检测结果生成一份详细的分析报告，报告应包含以下方面：
+1. 两个序列的对比摘要
+2. 差异模式与趋势分析
+3. 各检测方法发现的问题详解
+4. 异常的可能原因
+5. 建议的后续操作
+
+检测结果信息：
+- 用户查询: {user_query}
+- 总体分类: {classification}
+- 综合得分: {score:.2f}
+- 发现异常点数: {anomaly_count}
+- 发现异常区间数: {interval_count}
+
+检测方法详情:
+{json.dumps(method_details, ensure_ascii=False, indent=2)}
+
+请注意以下要求：
+- 生成的报告应该使用Markdown格式，包含标题(##)、子标题(###)、列表项等
+- 每个部分应该使用二级标题(##)，内容要精炼但信息量丰富
+- 不要简单重复上述数据，而是提供有价值的见解和分析
+- 总长度控制在600字以内
+"""
+
+    # 调用大模型生成报告
+    messages = [
+        {"role": "system", "content": "你是一位专业的系统运维分析师，擅长解读时序数据异常检测结果并提供深入分析。你的回复应使用规范的Markdown格式。"},
+        {"role": "user", "content": prompt}
+    ]
+    
     try:
-        start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
-        end_dt = datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
-        period_desc = f"{start_dt.strftime('%Y年%m月%d日 %H:%M')} 至 {end_dt.strftime('%Y年%m月%d日 %H:%M')}"
-    except:
-        period_desc = f"{start_time} 至 {end_time}"
-    
-    # 根据评分生成总体分析
-    if classification == "正常":
-        summary_line = f"系统运行正常，未发现明显异常。"
-        if total_anomalies > 0:
-            summary_line += f" 虽然检测到 {total_anomalies} 个可能的异常点，但整体影响较小，综合评分为 {composite_score:.2f}，低于异常阈值。"
-    elif classification == "轻度异常":
-        summary_line = f"系统运行存在轻微异常，综合评分为 {composite_score:.2f}。"
-        if total_anomalies > 0:
-            summary_line += f" 共检测到 {total_anomalies} 个异常点，可能需要关注。"
-    else:  # 高置信度异常
-        summary_line = f"系统运行存在明显异常，综合评分为 {composite_score:.2f}，超过高置信阈值。"
-        if total_anomalies > 0:
-            summary_line += f" 共检测到 {total_anomalies} 个异常点，强烈建议进一步分析。"
-    
-    # 构建详细分析报告
-    if is_multi_series:
-        ip1 = series_info.get("ip", "主机")
-        ip2 = series_info.get("ip2", "主机")
-        field = series_info.get("field", "指标")
+        # 导入位于上层的llm_call函数
+        import sys, os
+        sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+        from agent import llm_call
         
-        # 更具体的多序列分析摘要
-        analysis_text = f"""## {ip1} {field} 对比分析报告
+        response = llm_call(messages)
+        if response and 'content' in response:
+            return response['content']
+        else:
+            print("LLM返回格式不正确或为空")
+            return f"## 异常检测报告\n\n**分类**: {classification}\n**得分**: {score:.2f}\n**异常点数**: {anomaly_count}"
+    except Exception as e:
+        print(f"LLM调用失败: {e}")
+        return f"## 异常检测报告\n\n**分类**: {classification}\n**得分**: {score:.2f}\n**异常点数**: {anomaly_count}"
 
-**分析时段**: {period_desc}
-
-**总体分析**: {summary_line}
-
-**对比结果摘要**: 对比分析了两个时间段的{field}数据，{"发现明显的差异模式" if classification != "正常" else "两个序列整体模式相似"}。
-"""
-        if total_anomalies > 0:
-            analysis_text += f"共检测到 {total_anomalies} 个异常点和 {total_intervals} 个异常区间。\n"
-        
-        analysis_text += "\n**检测方法详情**:\n"
-    else:
-        analysis_text = f"""## {ip} {field} 异常检测报告
-
-**分析时段**: {period_desc}
-
-**总体分析**: {summary_line}
-
-**检测方法详情**:
-"""
-
-    # 添加各个检测方法的详细分析
-    for result in detection_results:
-        # 跳过无异常的方法
-        if not result.anomalies and not result.intervals:
-            continue
-            
-        method_desc = result.description
-        
-        # 处理不同类型的异常
-        if result.visual_type == "point" and result.anomalies:
-            analysis_text += f"\n- **{result.method}**: 检测到 {len(result.anomalies)} 个异常点。"
-            
-            # 添加代表性异常的解释
-            if result.explanation and len(result.explanation) > 0:
-                max_examples = min(3, len(result.explanation))
-                analysis_text += " 典型异常表现为: "
-                for i in range(max_examples):
-                    # 尝试将时间戳转换为可读时间
-                    try:
-                        ts = result.anomalies[i]
-                        ts_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
-                        analysis_text += f"{ts_str} - {result.explanation[i]}; "
-                    except:
-                        analysis_text += f"{result.explanation[i]}; "
-        
-        elif result.visual_type in ("range", "curve") and result.intervals:
-            analysis_text += f"\n- **{result.method}**: 检测到 {len(result.intervals)} 个异常区间。"
-            
-            # 添加代表性区间的解释
-            if result.explanation and len(result.explanation) > 0:
-                max_examples = min(2, len(result.explanation))
-                analysis_text += " 典型异常区间表现为: "
-                for i in range(max_examples):
-                    try:
-                        start, end = result.intervals[i]
-                        start_str = datetime.fromtimestamp(start).strftime("%H:%M:%S")
-                        end_str = datetime.fromtimestamp(end).strftime("%H:%M:%S")
-                        analysis_text += f"{start_str}至{end_str} - {result.explanation[i]}; "
-                    except:
-                        analysis_text += f"{result.explanation[i]}; "
-        
-        elif result.visual_type == "none" and result.explanation:
-            analysis_text += f"\n- **{result.method}**: {' '.join(result.explanation[:2])}"
-    
-    # 添加建议和结论
-    analysis_text += "\n\n**建议**:\n"
-    
-    if classification == "正常":
-        analysis_text += "- 系统运行状态良好，可继续当前运维策略。"
-    elif classification == "轻度异常":
-        analysis_text += f"- 关注 {field} 指标的变化趋势，尤其是 {', '.join(methods_with_anomalies[:2])} 检测到的异常点。\n"
-        analysis_text += "- 考虑设置该指标的监控告警，避免问题恶化。"
-    else:  # 高置信度异常
-        analysis_text += f"- 建议立即排查 {field} 指标异常的根本原因，特别是 {', '.join(methods_with_anomalies[:2])} 检测到的问题。\n"
-        analysis_text += "- 检查系统配置和相关依赖组件状态。\n"
-        analysis_text += "- 考虑与其他指标交叉分析，确定影响范围。"
-    
-    return analysis_text
 
 def generate_report_single(series, ip, field, user_query):
     """
@@ -1181,15 +1286,6 @@ def generate_report_single(series, ip, field, user_query):
         "end": end_time
     }
     
-    # 生成分析报告文字
-    analysis_text = generate_text_analysis(
-        method_results, 
-        result["composite_score"], 
-        result["classification"], 
-        series_info,
-        is_multi_series=False
-    )
-    
     # 生成汇总图表
     summary_path = os.path.join(base_dir, "summary.html")
     chart_path, tooltip_map = generate_summary_echarts_html(
@@ -1197,12 +1293,18 @@ def generate_report_single(series, ip, field, user_query):
         title=f"{ip} {field} 异常检测汇总图"
     )
     
+    # 调用大模型生成详细的分析报告
+    print(f"调用大模型生成报告，用户查询: {user_query}")
+    llm_analysis = generate_llm_report(result, "single", user_query)
+    print(f"大模型生成的报告长度: {len(llm_analysis)}")
+    
     # 生成最终报告
     final_report_path = os.path.join(base_dir, "final_report.html")
-    generate_report_single_series(
+    generate_report_html(
         user_query, chart_path, method_results, tooltip_map, final_report_path, 
-        analysis_text=analysis_text, composite_score=result["composite_score"],
-        classification=result["classification"]  # 确保传递分类和得分
+        composite_score=result["composite_score"],
+        classification=result["classification"],
+        llm_analysis=llm_analysis
     )
     
     # 返回结果
@@ -1212,8 +1314,9 @@ def generate_report_single(series, ip, field, user_query):
         "anomaly_times": result["anomaly_times"],
         "method_results": [mr.to_dict() for mr in method_results],
         "report_path": final_report_path,
-        "analysis_text": analysis_text
+        "llm_analysis": llm_analysis
     }
+
 
 def generate_report_multi(series1, series2, ip1, ip2, field, user_query):
     """
@@ -1240,27 +1343,6 @@ def generate_report_multi(series1, series2, ip1, ip2, field, user_query):
     base_dir = f"output/plots/{ip1}_{ip2}_{field}_{timestamp}"
     os.makedirs(base_dir, exist_ok=True)
     
-    # 提取时间信息构建 series_info
-    start_time = datetime.fromtimestamp(series1[0][0]).strftime("%Y-%m-%d %H:%M:%S") if series1 else "未知"
-    end_time = datetime.fromtimestamp(series1[-1][0]).strftime("%Y-%m-%d %H:%M:%S") if series1 else "未知"
-    
-    series_info = {
-        "ip": ip1,
-        "ip2": ip2,
-        "field": field,
-        "start": start_time,
-        "end": end_time
-    }
-    
-    # 生成分析报告文字
-    analysis_text = generate_text_analysis(
-        method_results, 
-        result["composite_score"], 
-        result["classification"], 
-        series_info,
-        is_multi_series=True
-    )
-    
     # 生成汇总图表 - 传递两个序列
     summary_path = os.path.join(base_dir, "summary.html")
     chart_path, tooltip_map = generate_summary_echarts_html(
@@ -1268,12 +1350,19 @@ def generate_report_multi(series1, series2, ip1, ip2, field, user_query):
         title=f"{ip1} vs {ip2} {field} 对比异常检测汇总图"
     )
     
+    # 调用大模型生成详细的分析报告
+    print(f"调用大模型生成报告，用户查询: {user_query}")
+    llm_analysis = generate_llm_report(result, "multi", user_query)
+    print(f"大模型生成的报告长度: {len(llm_analysis)}")
+    
     # 生成最终报告
     final_report_path = os.path.join(base_dir, "final_report.html")
-    generate_report_single_series(
+    generate_report_html(
         user_query, chart_path, method_results, tooltip_map, final_report_path,
-        analysis_text=analysis_text, composite_score=result["composite_score"], 
-        classification=result["classification"]  # 确保传递分类和得分
+        composite_score=result["composite_score"], 
+        classification=result["classification"],
+        llm_analysis=llm_analysis,
+        is_multi_series=True
     )
     
     # 返回结果
@@ -1284,11 +1373,14 @@ def generate_report_multi(series1, series2, ip1, ip2, field, user_query):
         "anomaly_intervals": result["anomaly_intervals"],
         "method_results": [mr.to_dict() for mr in method_results],
         "report_path": final_report_path,
-        "analysis_text": analysis_text
+        "llm_analysis": llm_analysis
     }
-def generate_report_single_series(user_query, chart_path, detection_results, tooltip_map, output_path, analysis_text=None, composite_score=0.0, classification="正常"):
+
+
+def generate_report_html(user_query, chart_path, detection_results, tooltip_map, output_path, 
+                          composite_score=0.0, classification="正常", llm_analysis=None, is_multi_series=False):
     """
-    生成单序列异常检测HTML报告
+    生成异常检测HTML报告
     
     参数:
         user_query: 用户原始查询
@@ -1296,14 +1388,14 @@ def generate_report_single_series(user_query, chart_path, detection_results, too
         detection_results: 检测结果列表
         tooltip_map: 异常点/区间映射
         output_path: 输出HTML报告路径
-        analysis_text: 可选，分析文本报告
         composite_score: 综合得分
         classification: 分类结果
+        llm_analysis: 大模型生成的分析报告
+        is_multi_series: 是否为多序列分析
     
     返回:
         str: 生成的报告路径
     """
-    # 使用传入的综合评分和分类，而不是重新计算
     # 设置报告样式类
     if classification == "高置信度异常":
         alert_class = "alert-danger"
@@ -1311,48 +1403,6 @@ def generate_report_single_series(user_query, chart_path, detection_results, too
         alert_class = "alert-warning"
     else:
         alert_class = "alert-success"
-    
-    # 构建异常点说明HTML
-    anomaly_explanations_html = ""
-    for point_id, info in tooltip_map.items():
-        # 格式化时间戳
-        if "ts" in info:
-            time_str = datetime.fromtimestamp(info["ts"]).strftime("%Y-%m-%d %H:%M:%S")
-            anomaly_explanations_html += f"""
-            <div class="card mb-2">
-                <div class="card-header">
-                    <strong>异常点 #{point_id}</strong> - {time_str}
-                </div>
-                <div class="card-body">
-                    <p><strong>方法:</strong> {info["method"]}</p>
-                    <p><strong>值:</strong> {info.get("value", "N/A")}</p>
-                    <p><strong>说明:</strong> {info["explanation"]}</p>
-                </div>
-            </div>
-            """
-        # 区间异常
-        elif "ts_start" in info and "ts_end" in info:
-            start_str = datetime.fromtimestamp(info["ts_start"]).strftime("%Y-%m-%d %H:%M:%S")
-            end_str = datetime.fromtimestamp(info["ts_end"]).strftime("%Y-%m-%d %H:%M:%S")
-            anomaly_explanations_html += f"""
-            <div class="card mb-2">
-                <div class="card-header">
-                    <strong>异常区间 #{point_id}</strong> - {start_str} 至 {end_str}
-                </div>
-                <div class="card-body">
-                    <p><strong>方法:</strong> {info["method"]}</p>
-                    <p><strong>说明:</strong> {info["explanation"]}</p>
-                </div>
-            </div>
-            """
-    
-    # 如果没有异常，显示正常信息
-    if not tooltip_map:
-        anomaly_explanations_html = """
-        <div class="alert alert-success">
-            <p>未检测到异常点。</p>
-        </div>
-        """
     
     # 构建方法摘要HTML
     methods_summary_html = ""
@@ -1368,33 +1418,62 @@ def generate_report_single_series(user_query, chart_path, detection_results, too
         </div>
         """
     
-    # 如果提供了分析文本，则转换成HTML格式
-    formatted_text = ""
-    if analysis_text:
-        # 替换Markdown格式为HTML格式，避免使用复杂的f-string转义
-        formatted_text = analysis_text.replace('\n', '<br>')
-        formatted_text = re.sub(r'## (.*)', r'<h3>\1</h3>', formatted_text)
-        formatted_text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', formatted_text)
-        formatted_text = re.sub(r'- (.*)', r'• \1<br>', formatted_text)
+    # 处理LLM分析文本 - 使用更完善的Markdown解析
+    formatted_llm_analysis = ""
+    if llm_analysis:
+        # 使用更完善的Markdown到HTML转换
+        formatted_llm_analysis = convert_markdown_to_html(llm_analysis)
+    
+    report_title = "多序列对比异常检测报告" if is_multi_series else "时序数据异常检测报告"
     
     # 构建完整HTML报告
     html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>异常检测报告</title>
+    <title>{report_title}</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body {{ padding: 20px; }}
         .iframe-container {{ width: 100%; height: 650px; border: none; }}
         .markdown-content {{ line-height: 1.6; }}
-        .markdown-content h3 {{ margin-top: 20px; margin-bottom: 15px; color: #333; }}
+        .markdown-content h3 {{ margin-top: 20px; margin-bottom: 15px; color: #333; font-size: 1.4rem; }}
+        .markdown-content h2 {{ margin-top: 25px; margin-bottom: 15px; color: #222; font-size: 1.6rem; }}
+        .markdown-content h1 {{ margin-top: 30px; margin-bottom: 20px; color: #111; font-size: 1.8rem; }}
+        .markdown-content p {{ margin-bottom: 15px; font-size: 1rem; }}
         .markdown-content strong {{ font-weight: 600; color: #444; }}
+        .markdown-content ul, .markdown-content ol {{ margin-bottom: 15px; padding-left: 25px; }}
+        .markdown-content li {{ margin-bottom: 5px; }}
+        .info-box {{ 
+            border: 1px solid #ddd; 
+            border-radius: 5px; 
+            padding: 10px; 
+            margin-bottom: 15px; 
+            background-color: #f9f9f9; 
+        }}
+        .hint-text {{
+            font-style: italic;
+            color: #666;
+            margin-top: 5px;
+            font-size: 0.9em;
+        }}
+        .ai-analysis {{
+            background-color: #f8f9fa;
+            border-left: 4px solid #17a2b8;
+            padding: 15px;
+            margin: 20px 0;
+        }}
+        .ai-analysis-title {{
+            color: #17a2b8;
+            font-weight: 600;
+            margin-bottom: 10px;
+            font-size: 1.2rem;
+        }}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1 class="mt-4 mb-4">时序数据异常检测报告</h1>
+        <h1 class="mt-4 mb-4">{report_title}</h1>
         
         <div class="card mb-4">
             <div class="card-header">
@@ -1415,9 +1494,12 @@ def generate_report_single_series(user_query, chart_path, detection_results, too
                     <p>综合得分: {composite_score:.2f}</p>
                 </div>
                 
-                <!-- 将分析报告摘要内容放到分析结论中 -->
-                <div class="markdown-content mt-3">
-                    {formatted_text if analysis_text else ""}
+                <!-- AI分析报告 -->
+                <div class="ai-analysis">
+                    <div class="ai-analysis-title">AI辅助分析报告</div>
+                    <div class="markdown-content">
+                        {formatted_llm_analysis if llm_analysis else "未生成AI分析报告"}
+                    </div>
                 </div>
             </div>
         </div>
@@ -1427,12 +1509,12 @@ def generate_report_single_series(user_query, chart_path, detection_results, too
                 <strong>异常检测图表</strong>
             </div>
             <div class="card-body p-0">
+                <div class="info-box">
+                    <p class="hint-text">提示: 将鼠标悬停在异常点或异常区间上可查看详细信息。异常点/区间以红色标记并带有编号。</p>
+                </div>
                 <iframe class="iframe-container" src="{os.path.basename(chart_path)}"></iframe>
             </div>
         </div>
-        
-        <h2 class="mt-4 mb-3">异常点详细说明</h2>
-        {anomaly_explanations_html}
         
         <h2 class="mt-4 mb-3">检测方法摘要</h2>
         {methods_summary_html}
@@ -1451,6 +1533,42 @@ def generate_report_single_series(user_query, chart_path, detection_results, too
         f.write(html)
 
     return output_path
+
+def get_anomaly_detection_report(result, detection_type):
+    """
+    根据异常检测结果生成报告
+    
+    参数:
+        result: 异常检测结果
+        detection_type: 检测类型 ("single" 或 "multi")
+        
+    返回:
+        str: 格式化的报告文本
+    """
+    # 使用大模型生成报告
+    llm_analysis = generate_llm_report(result, detection_type, result.get("user_query", ""))
+    
+    # 准备报告标题和基本信息
+    if detection_type == "single":
+        title = "单序列异常检测报告"
+        anomaly_info = f"**异常点数**：{len(result['anomaly_times'])}"
+    else:  # multi
+        title = "多序列对比异常检测报告"
+        anomaly_info = f"**异常段数**：{len(result.get('anomaly_intervals', []))}"
+    
+    # 生成最终报告
+    final_report = f"""
+## {title}
+
+**结论**：{result['classification']}  
+**综合得分**：{result['composite_score']:.2f}  
+{anomaly_info}
+
+{llm_analysis}
+
+**图表路径**：{result['report_path']}
+"""
+    return final_report
 
 # === output/visualization.py ===
 # output/visualization.py
@@ -1514,7 +1632,8 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
         if len(series1) == len(adjusted_series2):
             diff_data = []
             for i in range(len(series1)):
-                diff_data.append([series1[i][0] * 1000, series1[i][1] - adjusted_series2[i][1]])
+                diff_value = round(series1[i][1] - adjusted_series2[i][1], 3)
+                diff_data.append([series1[i][0] * 1000, diff_value])
                 
             series_list.append({
                 "name": "差值曲线",
@@ -1542,28 +1661,33 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
                     continue
                 
                 # 构建标签和提示信息
-                label = f"异常点#{point_counter}\n方法:{result.method}"
                 explanation = ""
                 if i < len(result.explanation):
                     explanation = result.explanation[i]
-                    label += f"\n解释#{explanation_counter}"
-                    # 存储对应关系，用于报告生成
-                    tooltip_map[point_counter] = {
-                        "method": result.method,
-                        "ts": ts,
-                        "value": value,
-                        "explanation": explanation
-                    }
-                    explanation_counter += 1
                 
-                # 添加标记点
+                # 存储对应关系，用于报告生成
+                tooltip_map[point_counter] = {
+                    "method": result.method,
+                    "ts": ts,
+                    "value": value,
+                    "explanation": explanation
+                }
+                explanation_counter += 1
+                
+                # 添加标记点，将异常信息存储在数据中供自定义tooltip使用
                 mark_points.append({
                     "coord": [ts * 1000, value],
                     "symbol": "circle",
-                    "symbolSize": 7,
+                    "symbolSize": 8,
                     "itemStyle": {"color": "red"},
                     "label": {"formatter": f"#{point_counter}", "show": True, "position": "top"},
-                    "tooltip": {"formatter": label}
+                    "anomalyInfo": {
+                        "id": point_counter,
+                        "method": result.method,
+                        "timestamp": format_timestamp(ts),
+                        "value": value,
+                        "explanation": explanation
+                    }
                 })
                 point_counter += 1
 
@@ -1575,15 +1699,6 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
                 if i < len(result.explanation):
                     area_explanation = result.explanation[i]
                 
-                # 添加标记区域
-                mark_areas.append({
-                    "itemStyle": {"color": "rgba(255, 100, 100, 0.2)"},
-                    "label": {"show": True, "position": "top", "formatter": f"#{point_counter}"},
-                    "tooltip": {"formatter": f"异常区间#{point_counter}\n方法:{result.method}\n{area_explanation}"},
-                    "xAxis": start * 1000,
-                    "xAxis2": end * 1000
-                })
-                
                 # 存储对应关系
                 tooltip_map[point_counter] = {
                     "method": result.method,
@@ -1591,6 +1706,21 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
                     "ts_end": end,
                     "explanation": area_explanation
                 }
+                
+                # 添加标记区域，将异常信息存储在数据中供自定义tooltip使用
+                mark_areas.append({
+                    "itemStyle": {"color": "rgba(255, 100, 100, 0.2)"},
+                    "label": {"show": True, "position": "top", "formatter": f"#{point_counter}"},
+                    "xAxis": start * 1000,
+                    "xAxis2": end * 1000,
+                    "anomalyInfo": {
+                        "id": point_counter,
+                        "method": result.method,
+                        "startTime": format_timestamp(start),
+                        "endTime": format_timestamp(end),
+                        "explanation": area_explanation
+                    }
+                })
                 
                 point_counter += 1
                 explanation_counter += 1
@@ -1621,9 +1751,20 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
     # 构建 ECharts 选项
     option = {
         "title": {"text": title, "left": "center"},
-        "tooltip": {"trigger": "axis", "axisPointer": {"type": "cross"}},
+        "tooltip": {
+            "trigger": "axis", 
+            "axisPointer": {"type": "cross"}, 
+            "confine": True,
+            "backgroundColor": "rgba(255, 255, 255, 0.9)",
+            "borderColor": "#ccc",
+            "borderWidth": 1,
+            "textStyle": {
+                "color": "#333"
+            },
+            "extraCssText": "box-shadow: 0 0 8px rgba(0, 0, 0, 0.1);"
+        },
         "legend": {"top": 30, "data": [s["name"] for s in series_list]},
-        "grid": {"left": "3%", "right": need_second_yaxis and "8%" or "4%", "bottom": "3%", "containLabel": True},
+        "grid": {"left": "3%", "right": need_second_yaxis and "8%" or "4%", "bottom": "8%", "containLabel": True},
         "toolbox": {
             "feature": {
                 "saveAsImage": {},
@@ -1634,14 +1775,18 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
         "xAxis": {
             "type": "time",
             "name": "时间",
-            "axisLabel": {"formatter": "{yyyy}-{MM}-{dd} {HH}:{mm}"}
+            "axisLabel": {
+                "formatter": "{yyyy}-{MM}-{dd} {HH}:{mm}",
+                "rotate": 30,  # 旋转标签以避免重叠
+                "margin": 15   # 增加边距
+            }
         },
         "yAxis": [
             {"type": "value", "name": "数值", "position": "left"}
         ],
         "series": series_list,
         "dataZoom": [
-            {"type": "slider", "show": True, "xAxisIndex": [0], "start": 0, "end": 100},
+            {"type": "slider", "show": True, "xAxisIndex": [0], "start": 0, "end": 100, "bottom": 10},
             {"type": "inside", "xAxisIndex": [0], "start": 0, "end": 100}
         ]
     }
@@ -1657,27 +1802,124 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
 
     # 整合标记点和标记区域
     if mark_points:
-        series_list[0]["markPoint"] = {"data": mark_points, "symbolSize": 8}
+        series_list[0]["markPoint"] = {
+            "data": mark_points, 
+            "symbolSize": 8,
+            "emphasis": {"scale": True},
+            "label": {"show": True}
+        }
     
     if mark_areas:
         series_list[0]["markArea"] = {
-            "data": [[{"xAxis": area["xAxis"], "itemStyle": area["itemStyle"]}, 
-                     {"xAxis": area["xAxis2"]}] for area in mark_areas]
+            "data": [[{"xAxis": area["xAxis"], "itemStyle": area["itemStyle"], "anomalyInfo": area["anomalyInfo"]}, 
+                     {"xAxis": area["xAxis2"]}] for area in mark_areas],
+            "emphasis": {"focus": "self"}
         }
 
-    # 生成HTML
+    # 生成HTML，添加自定义JavaScript处理异常点的tooltip
     html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <title>{title}</title>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+    <style>
+        body {{ margin: 0; padding: 0; }}
+        #container {{ width: 100%; height: 100vh; }}
+        #{chart_id} {{ width: 100%; height: 650px; }}
+        
+        /* 自定义异常点提示样式 */
+        .anomaly-tooltip {{
+            background-color: rgba(255, 255, 255, 0.9);
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            padding: 10px;
+            box-shadow: 0 0 8px rgba(0, 0, 0, 0.1);
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+            color: #333;
+            max-width: 300px;
+        }}
+        .anomaly-tooltip-title {{
+            font-weight: bold;
+            margin-bottom: 5px;
+            color: #d23;
+        }}
+        .anomaly-tooltip-item {{
+            display: flex;
+            margin: 2px 0;
+        }}
+        .anomaly-tooltip-label {{
+            font-weight: bold;
+            margin-right: 8px;
+            color: #666;
+            min-width: 60px;
+        }}
+        .anomaly-tooltip-value {{
+            color: #333;
+        }}
+    </style>
 </head>
 <body>
-    <div id="{chart_id}" style="width:100%; height:600px;"></div>
+    <div id="container">
+        <div id="{chart_id}"></div>
+    </div>
     <script>
         var chart = echarts.init(document.getElementById('{chart_id}'));
         var option = {json.dumps(option, ensure_ascii=False)};
+        
+        // 自定义tooltip处理函数
+        chart.on('mouseover', function(params) {{
+            if (params.componentType === 'markPoint' && params.data && params.data.anomalyInfo) {{
+                var info = params.data.anomalyInfo;
+                var content = 
+                    '<div class="anomaly-tooltip">' +
+                    '<div class="anomaly-tooltip-title">异常点 #' + info.id + '</div>' +
+                    '<div class="anomaly-tooltip-item"><span class="anomaly-tooltip-label">方法:</span><span class="anomaly-tooltip-value">' + info.method + '</span></div>' + 
+                    '<div class="anomaly-tooltip-item"><span class="anomaly-tooltip-label">时间:</span><span class="anomaly-tooltip-value">' + info.timestamp + '</span></div>' + 
+                    '<div class="anomaly-tooltip-item"><span class="anomaly-tooltip-label">数值:</span><span class="anomaly-tooltip-value">' + info.value.toFixed(2) + '</span></div>' + 
+                    '<div class="anomaly-tooltip-item"><span class="anomaly-tooltip-label">说明:</span><span class="anomaly-tooltip-value">' + info.explanation + '</span></div>' +
+                    '</div>';
+                
+                chart.setOption({{
+                    tooltip: {{
+                        formatter: content,
+                        extraCssText: 'padding: 0; border: none; background: transparent;'
+                    }}
+                }});
+            }}
+            else if (params.componentType === 'markArea' && params.data && params.data[0] && params.data[0].anomalyInfo) {{
+                var info = params.data[0].anomalyInfo;
+                var content = 
+                    '<div class="anomaly-tooltip">' +
+                    '<div class="anomaly-tooltip-title">异常区间 #' + info.id + '</div>' +
+                    '<div class="anomaly-tooltip-item"><span class="anomaly-tooltip-label">方法:</span><span class="anomaly-tooltip-value">' + info.method + '</span></div>' + 
+                    '<div class="anomaly-tooltip-item"><span class="anomaly-tooltip-label">开始:</span><span class="anomaly-tooltip-value">' + info.startTime + '</span></div>' + 
+                    '<div class="anomaly-tooltip-item"><span class="anomaly-tooltip-label">结束:</span><span class="anomaly-tooltip-value">' + info.endTime + '</span></div>' + 
+                    '<div class="anomaly-tooltip-item"><span class="anomaly-tooltip-label">说明:</span><span class="anomaly-tooltip-value">' + info.explanation + '</span></div>' +
+                    '</div>';
+                
+                chart.setOption({{
+                    tooltip: {{
+                        formatter: content,
+                        extraCssText: 'padding: 0; border: none; background: transparent;'
+                    }}
+                }});
+            }}
+        }});
+        
+        chart.on('mouseout', function(params) {{
+            if (params.componentType === 'markPoint' || params.componentType === 'markArea') {{
+                // 恢复默认tooltip
+                chart.setOption({{
+                    tooltip: {{
+                        formatter: null,
+                        extraCssText: option.tooltip.extraCssText
+                    }}
+                }});
+            }}
+        }});
+        
         chart.setOption(option);
         window.addEventListener('resize', function() {{
             chart.resize();
@@ -1697,6 +1939,13 @@ def generate_summary_echarts_html(series1, series2=None, detection_results=None,
     else:
         return html, tooltip_map
 
+def format_timestamp(ts):
+    """将时间戳格式化为可读时间"""
+    from datetime import datetime
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except:
+        return str(ts)
 
 # 向后兼容函数
 def generate_echarts_html_single(series, anomalies, title="单序列异常检测"):
