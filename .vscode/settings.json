@@ -1,0 +1,12 @@
+{
+  "python.defaultInterpreterPath": "/mnt/data/aiagent-ts/venv/bin/python3",
+  "python.pythonPath": "/mnt/data/aiagent-ts/venv/bin/python3",
+  "python.analysis.extraPaths": [
+    "/mnt/data/aiagent-ts"
+  ],
+  "python.analysis.typeCheckingMode": "off",
+  "python.linting.enabled": true,
+  "python.formatting.provider": "black",
+  "git.ignoreLimitWarning": true
+}
+

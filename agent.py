@@ -4,11 +4,14 @@ import json
 import datetime
 import requests
 import time
+import json, datetime, traceback
 import os  
 import traceback
 import hashlib
 import config 
 import dateparser
+
+from typing import Any, Dict
 from django.conf import settings
 
 from output.report_generator import get_anomaly_detection_report
@@ -18,7 +21,11 @@ from output.report_generator import generate_report_single, generate_report_mult
 from output.visualization import generate_summary_echarts_html
 from utils.ts_cache import ensure_cache_file, load_series_from_cache
 from utils.time_utils import parse_time_expressions
+from utils.ts_features import series_features
+from utils.ts_features import analyze_time_series_features, select_detection_methods
 
+# MCP客户端
+from mcp_client import get_mcp_client
 AIOPS_BACKEND_DOMAIN = 'https://aiopsbackend.cstcloud.cn'
 LLM_URL = 'http://10.16.1.16:58000/v1/chat/completions'
 AUTH = ('chelseyyycheng@outlook.com', 'UofV1uwHwhVp9tcTue')
@@ -174,8 +181,302 @@ tools = [
             },
             "required": ["ip1","field1","start1","end1","ip2","field2","start2","end2"]
         }
+    },
+    {
+        "name": "分析时序数据特征",
+        "description": "分析时序数据的统计特性、趋势、季节性、波动性等特征",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "series": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": [
+                            {"type": "number"},
+                            {"type": "number"}
+                        ]
+                    },
+                    "description": "时序数据，格式为 [[timestamp, value], ...]"
+                }
+            },
+            "required": ["series"]
+        }
+    },
+    {
+        "name": "获取异常检测方法信息",
+        "description": "从MCP服务器获取所有可用的异常检测方法信息",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "选择适合的异常检测方法",
+        "description": "根据时序数据特征和检测方法信息，选择最适合的检测方法",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "features": {
+                    "type": "object",
+                    "description": "时序数据特征"
+                },
+                "detector_info": {
+                    "type": "object",
+                    "description": "检测方法信息"
+                }
+            },
+            "required": ["features", "detector_info"]
+        }
+    },
+    {
+        "name": "执行异常检测",
+        "description": "使用指定的方法对时序数据进行异常检测",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "method": {
+                    "type": "string",
+                    "description": "检测方法名称，如'IQR异常检测'"
+                },
+                "series": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": [
+                            {"type": "number"},
+                            {"type": "number"}
+                        ]
+                    },
+                    "description": "时序数据，格式为 [[timestamp, value], ...]"
+                },
+                "params": {
+                    "type": "object",
+                    "description": "检测参数"
+                }
+            },
+            "required": ["method", "series", "params"]
+        }
+    },
+    {
+        "name": "计算综合异常评分",
+        "description": "根据多个检测方法的结果计算综合异常评分",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "detection_results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object"
+                    },
+                    "description": "多个检测方法的结果列表"
+                }
+            },
+            "required": ["detection_results"]
+        }
+    },
+    {
+        "name": "生成异常检测报告",
+        "description": "根据异常检测结果生成综合报告",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "series": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": [
+                            {"type": "number"},
+                            {"type": "number"}
+                        ]
+                    },
+                    "description": "时序数据，格式为 [[timestamp, value], ...]"
+                },
+                "detection_results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object"
+                    },
+                    "description": "多个检测方法的结果列表"
+                },
+                "composite_score": {
+                    "type": "number",
+                    "description": "综合异常评分"
+                },
+                "classification": {
+                    "type": "string",
+                    "description": "异常分类，如'正常'、'轻度异常'、'高置信度异常'"
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "元数据，如IP、指标名称、时间范围等"
+                }
+            },
+            "required": ["series", "detection_results", "composite_score", "classification", "metadata"]
+        }
     }
 ]
+
+###############################################################################
+# 新增工具函数
+###############################################################################
+
+async def analyze_ts_features(series_data):
+    """分析时序数据特征"""
+    try:
+        features = analyze_time_series_features(series_data)
+        return features
+    except Exception as e:
+        print(f"分析时序特征错误: {e}")
+        traceback.print_exc()
+        return {"error": f"分析时序特征失败: {str(e)}"}
+
+async def get_detection_methods():
+    """从MCP服务器获取异常检测方法信息"""
+    try:
+        client = await get_mcp_client()
+        detector_info = await client.get_all_detectors()
+        return detector_info
+    except Exception as e:
+        print(f"获取检测方法信息错误: {e}")
+        traceback.print_exc()
+        return {"error": f"获取检测方法信息失败: {str(e)}"}
+
+async def select_best_detection_methods(features, detector_info):
+    """根据时序特征和检测方法信息，选择最适合的检测方法"""
+    try:
+        selected_methods = select_detection_methods(features, detector_info)
+        return selected_methods
+    except Exception as e:
+        print(f"选择检测方法错误: {e}")
+        traceback.print_exc()
+        return {"error": f"选择检测方法失败: {str(e)}"}
+
+async def execute_detection(method, series_data, params):
+    """执行异常检测"""
+    try:
+        # 准备数据
+        data = {"series": series_data}
+        
+        # 获取MCP客户端
+        client = await get_mcp_client()
+        
+        # 执行检测
+        result = await client.detect_anomalies(method, data, params)
+        
+        return result
+    except Exception as e:
+        print(f"执行异常检测错误: {e}")
+        traceback.print_exc()
+        return {"error": f"执行异常检测失败: {str(e)}"}
+
+def calculate_composite_score(detection_results):
+    """计算综合异常评分"""
+    try:
+        if not detection_results or len(detection_results) == 0:
+            return {"score": 0.0, "classification": "正常"}
+        
+        total_weight = 0.0
+        weighted_score = 0.0
+        all_anomalies = set()
+        
+        for result in detection_results:
+            # 跳过有错误的结果
+            if "error" in result:
+                continue
+            
+            # 获取权重
+            weight = result.get("parameters", {}).get("weight", 0.5)
+            total_weight += weight
+            
+            # 获取异常比例作为分数
+            anomaly_ratio = result.get("anomaly_ratio", 0)
+            # 转换为0-1的评分，使用对数变换防止大量异常点导致评分过高
+            method_score = min(0.8, 0.2 + 0.3 * np.log10(1 + anomaly_ratio * 100)) if anomaly_ratio > 0 else 0
+            
+            # 累加权重评分
+            weighted_score += weight * method_score
+            
+            # 收集所有异常点
+            all_anomalies.update(result.get("anomalies", []))
+        
+        # 计算最终得分
+        final_score = weighted_score / total_weight if total_weight > 0 else 0
+        
+        # 确定分类
+        if final_score >= config.HIGH_ANOMALY_THRESHOLD:
+            classification = "高置信度异常"
+        elif final_score >= config.MILD_ANOMALY_THRESHOLD:
+            classification = "轻度异常"
+        else:
+            classification = "正常"
+        
+        return {
+            "score": final_score,
+            "classification": classification,
+            "anomaly_count": len(all_anomalies),
+            "anomalies": sorted(list(all_anomalies))
+        }
+    except Exception as e:
+        print(f"计算综合评分错误: {e}")
+        traceback.print_exc()
+        return {"error": f"计算综合评分失败: {str(e)}"}
+
+async def generate_detection_report(series_data, detection_results, composite_score, classification, metadata):
+    """生成异常检测报告"""
+    try:
+        # 生成报告目录
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ip = metadata.get("ip", "unknown")
+        field = metadata.get("field", "unknown")
+        
+        base_dir = f"output/plots/{ip}_{field}_{timestamp}"
+        os.makedirs(base_dir, exist_ok=True)
+        
+        # 生成图表
+        chart_title = f"{ip} {field} 异常检测汇总图"
+        summary_path = os.path.join(base_dir, "summary.html")
+        chart_path, tooltip_map = generate_summary_echarts_html(
+            series_data, 
+            None,  # 单序列检测，无第二序列
+            detection_results, 
+            summary_path, 
+            title=chart_title
+        )
+        
+        # 生成LLM分析
+        user_query = metadata.get("user_query", "")
+        result_dict = {
+            "classification": classification,
+            "composite_score": composite_score,
+            "anomaly_times": composite_score.get("anomalies", []),
+            "method_results": detection_results,
+            "user_query": user_query
+        }
+        
+        llm_analysis = generate_llm_report(result_dict, "single")
+        
+        # 生成最终报告
+        final_report_path = os.path.join(base_dir, "final_report.html")
+        generate_report_html(
+            user_query, chart_path, detection_results, tooltip_map, final_report_path, 
+            composite_score=composite_score["score"],
+            classification=classification,
+            llm_analysis=llm_analysis,
+            is_multi_series=False
+        )
+        
+        return {
+            "report_path": final_report_path,
+            "chart_path": chart_path,
+            "llm_analysis": llm_analysis
+        }
+    except Exception as e:
+        print(f"生成报告错误: {e}")
+        traceback.print_exc()
+        return {"error": f"生成报告失败: {str(e)}"}
+
+###############################################################################
 
 def monitor_item_list(ip):
     url = f'{AIOPS_BACKEND_DOMAIN}/api/v1/monitor/mail/machine/field/?instance={ip}'
@@ -242,6 +543,9 @@ def validate_multi_series_params(action_input):
         if not all(param in action_input for param in pair):
             return False
     return True
+
+import numpy as np
+from output.report_generator import generate_llm_report, generate_report_html
 
 ###############################################################################
 def single_series_detect(ip, field, start, end, user_query=""):
@@ -362,23 +666,37 @@ def react(llm_text):
             return get_service_asset(action_input["service"]), False
         elif action == "请求智能运管后端Api，查询监控实例之间的拓扑关联关系":
             return get_service_asset_edges(action_input["service"], action_input["instance_ip"]), False
+        elif action == "分析时序数据特征":
+            # 异步函数需要特殊处理
+            result = asyncio.run(analyze_ts_features(action_input["series"]))
+            return result, False
+            
+        elif action == "获取异常检测方法信息":
+            result = asyncio.run(get_detection_methods())
+            return result, False
+            
+        elif action == "选择适合的异常检测方法":
+            result = asyncio.run(select_best_detection_methods(action_input["features"], action_input["detector_info"]))
+            return result, False
+            
+        elif action == "执行异常检测":
+            result = asyncio.run(execute_detection(action_input["method"], action_input["series"], action_input["params"]))
+            return result, False
+            
+        elif action == "计算综合异常评分":
+            result = calculate_composite_score(action_input["detection_results"])
+            return result, False
+            
+        elif action == "生成异常检测报告":
+            result = asyncio.run(generate_detection_report(
+                action_input["series"],
+                action_input["detection_results"],
+                action_input["composite_score"],
+                action_input["classification"],
+                action_input["metadata"]
+            ))
+            return result, False
         
-        elif action == "单序列异常检测(文件)":
-            result = single_series_detect(**action_input)
-            if "error" in result:
-                return result["error"], False
-
-            report = get_anomaly_detection_report(result, "single")
-            return report, False
-        elif action == "多序列对比异常检测(文件)":
-            if not validate_multi_series_params(action_input):
-                return "参数验证失败，请确保提供了两组完整的序列信息", False
-            result = multi_series_detect(**action_input)
-            if "error" in result:
-                return result["error"], False
-
-            report = get_anomaly_detection_report(result, "multi")
-            return report, False
         else:
             return f"未知工具调用: {action}", False
         
@@ -415,7 +733,11 @@ def shorten_tool_result(res):
                         "end": item.get("end", 0)
                     })
             return json.dumps(time_results, ensure_ascii=False)
-        return f"[List len={len(res)}]"
+        if len(res) > 10:
+            summary = {"总条目数": len(res), "前5条": res[:5], "后5条": res[-5:]}
+            return json.dumps(summary, ensure_ascii=False, indent=2)
+            
+        return json.dumps(res, ensure_ascii=False)
     elif isinstance(res, dict):
         summary = {}
         for k,v in res.items():
@@ -440,7 +762,14 @@ def chat(user_query):
 
     处理规则：
     1.请根据当前时间来推断用户输入的具体日期。
-    2.如果用户输入1个时间区间，则调用'单序列异常检测(文件)'。
+    2.使用下流程进行序列异常检测:
+      a. 获取时序数据
+      b. 分析时序数据特征
+      c. 获取所有检测方法信息
+      d. 根据特征和方法信息，选择适合的方法(约3-5个方法)
+      e. 对每个选定的方法执行异常检测
+      f. 计算综合异常评分
+      g. 生成异常检测报告
     3.如果用户输入多个时间区间，但是没有明显的比较词汇，则要在<补充请求>里提问，示例:
     <思考过程>我不知道用户是要对这些时间的数据分别进行单序列分析还是一起多序列分析，我需要确认</思考过程> <工具调用></工具调用> <调用参数></调用参数> <最终答案></最终答案> <补充请求>请问您是想对每段数据进行单序列分析，还是需要多序列的对比分析</补充请求> 
     4.如过用户输入2个时间区间，并且用户输入包含"对比"、"相比"、"比较"、"环比"、"VS"、"vs"、"变化"、"相较于"等明显比较词汇，则调用'多序列对比异常检测(文件)'。
@@ -460,6 +789,8 @@ def chat(user_query):
     2.当你的工具调用遇到错误时（例如"无效的field"），你必须主动思考如何解决这个问题，而不是立即询问用户。
     例如，如果出现"无效的field"错误，你应该自己主动调用"请求智能运管后端Api，查询监控实例有哪些监控项"工具来查询可用的监控项。
     3.模糊的信息通过<补充请求>来询问用户，明确的信息直接调用工具。
+    4.在选择异常检测方法时，请根据时序数据的特征和每种检测方法的适用场景，选择最合适的方法，不要全部使用。
+    5.检测方法的数量控制在3-5个，太少会缺少验证，太多会增加不必要的计算。
     
     '''
     history=[]
@@ -511,7 +842,7 @@ def chat(user_query):
 
         result, done = res
         
-        if any(action in txt for action in ["单序列异常检测(文件)", "多序列对比异常检测(文件)"]):
+        if action == "执行异常检测" or action == "生成异常检测报告":
             try:
                 action_input_match = re.search(r'<调用参数>(.*?)</调用参数>', txt, re.DOTALL)
                 if action_input_match:
@@ -522,7 +853,8 @@ def chat(user_query):
                                          txt, flags=re.DOTALL)
                     history[-1]["content"] = updated_txt
             except Exception as e:
-                print(f"处理调用参数出错: {str(e)}")  
+                print(f"处理调用参数出错: {str(e)}")
+
         short_result = shorten_tool_result(result)
         history.append({
             "role":"user",

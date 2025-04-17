@@ -1,0 +1,24 @@
+# 基础库
+numpy>=1.21.0
+pandas>=1.3.0
+scipy>=1.7.0
+matplotlib>=3.4.0
+dateparser>=1.1.0
+
+# 数据处理
+scikit-learn>=1.0.0
+
+# 网络请求
+requests>=2.25.0
+
+# Django依赖（用于配置）
+django>=3.2.0
+
+# MCP客户端
+mcp>=0.1.0
+
+# ADTK异常检测
+adtk>=0.6.2
+
+# 数据可视化
+plotly>=5.3.0
