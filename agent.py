@@ -1,30 +1,41 @@
-#! /usr/bin/env python3
-import re
-import json
+
+from __future__ import annotations
+
+import asyncio  # NEW
 import datetime
-import requests
-import time
-import json, datetime, traceback
-import os  
-import traceback
 import hashlib
-import config 
-import dateparser
-
+import json
+import os
+import re
+import time
+import traceback
 from typing import Any, Dict
-from django.conf import settings
 
-from output.report_generator import get_anomaly_detection_report
+import requests
+
+import config
+import dateparser
+import numpy as np
+from django.conf import settings  # noqa: F401 (kept, may be used elsewhere)
+
 from analysis.single_series import analyze_single_series
 from analysis.multi_series import analyze_multi_series
-from output.report_generator import generate_report_single, generate_report_multi
+from output.report_generator import (
+    generate_llm_report,
+    generate_report_html,
+    generate_report_single,
+    generate_report_multi,
+)
 from output.visualization import generate_summary_echarts_html
-from utils.ts_cache import ensure_cache_file, load_series_from_cache
+from utils.ts_cache import load_series_from_cache
 from utils.time_utils import parse_time_expressions
 from utils.ts_features import analyze_time_series_features, select_detection_methods
-
-# MCP客户端
+from utils.mcp_detector import detect_with_mcp
 from mcp_client import get_mcp_client
+import logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
 AIOPS_BACKEND_DOMAIN = 'https://aiopsbackend.cstcloud.cn'
 LLM_URL = 'http://10.16.1.16:58000/v1/chat/completions'
 AUTH = ('chelseyyycheng@outlook.com', 'UofV1uwHwhVp9tcTue')
@@ -369,7 +380,8 @@ async def execute_detection(method, series_data, params):
         client = await get_mcp_client()
         
         # 执行检测
-        result = await client.detect_anomalies(method, data, params)
+        client = await get_mcp_client()
+        result = await client.detect(method, series_data, params)
         
         # 检查是否有错误
         if isinstance(result, dict) and "error" in result:
@@ -853,19 +865,6 @@ def chat(user_query):
             continue
 
         result, done = res
-        
-        if action == "执行异常检测" or action == "生成异常检测报告":
-            try:
-                action_input_match = re.search(r'<调用参数>(.*?)</调用参数>', txt, re.DOTALL)
-                if action_input_match:
-                    action_input = json.loads(action_input_match.group(1))
-                    action_input["user_query"] = original_user_query
-                    updated_txt = re.sub(r'<调用参数>.*?</调用参数>', 
-                                         f'<调用参数>{json.dumps(action_input, ensure_ascii=False)}</调用参数>', 
-                                         txt, flags=re.DOTALL)
-                    history[-1]["content"] = updated_txt
-            except Exception as e:
-                print(f"处理调用参数出错: {str(e)}")
 
         short_result = shorten_tool_result(result)
         history.append({
