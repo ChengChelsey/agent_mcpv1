@@ -2,20 +2,20 @@
 ADTK MCP服务器
 
 这个模块实现了一个MCP服务器，将ADTK库中的异常检测算法作为工具暴露出来。
-使用装饰器方式注册工具，并通过ADTK的API获取方法信息。
+适配MCP 1.6.0版本，使用@mcptool装饰器。
 """
 
-import asyncio
 import os
+import sys
 import json
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Any, Optional, Tuple, Union
-import inspect
 import logging
+from typing import Dict, List, Any, Optional, Tuple
 from io import StringIO
 import contextlib
-import sys
+import inspect
+import traceback
 
 # ADTK 库
 import adtk
@@ -26,8 +26,11 @@ from sklearn.cluster import KMeans
 from sklearn.ensemble import IsolationForest
 from sklearn.linear_model import LinearRegression
 
-# MCP服务器
-from mcp import Server, mcp_tool, ServerParameters
+# 为MCP 1.6.0版本导入正确的模块
+from mcp import MCPServer
+from mcp.server import MCPServerParameters
+from mcp.core.tool import Tool, ToolCall
+from mcp.server.tools import mcptool
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("adtk_server")
@@ -49,16 +52,16 @@ DEFAULT_WEIGHTS = {
     "RegressionAD": 0.5
 }
 
-class ADTKServer(Server):
+class ADTKServer(MCPServer):
     """ADTK MCP服务器类，注册ADTK库中的异常检测方法作为工具"""
     
-    def __init__(self, server_params: ServerParameters):
+    def __init__(self, server_params: MCPServerParameters):
         super().__init__(server_params)
         self.detector_cache = {}  # 缓存创建的检测器实例
     
-    @mcp_tool("获取所有检测方法信息")
+    @mcptool("获取所有检测方法信息", "获取所有可用的ADTK检测方法信息")
     async def get_all_detectors(self) -> str:
-        """获取所有可用的ADTK检测方法信息，使用adtk.detector.print_all_models()"""
+        """获取所有可用的ADTK检测方法信息"""
         try:
             # 捕获print_all_models()的输出
             output = StringIO()
@@ -76,6 +79,7 @@ class ADTKServer(Server):
             return json.dumps(detector_info, ensure_ascii=False)
         except Exception as e:
             logger.error(f"获取检测方法信息错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"获取检测方法信息失败: {str(e)}"})
     
     def _extract_detector_info(self) -> Dict:
@@ -101,13 +105,12 @@ class ADTKServer(Server):
                     if param_name not in ['self', 'args', 'kwargs']:
                         param_info = {
                             "名称": param_name,
-                            "默认值": None if param.default is param.empty else param.default,
+                            "默认值": None if param.default is param.empty else str(param.default),
                             "类型": str(param.annotation) if param.annotation is not param.empty else "未指定"
                         }
                         parameters.append(param_info)
             
             # 判断是单变量还是多变量检测器
-            is_multivariate = any(base.__name__ in ["Detector1D", "DetectorHD"] for base in cls.__mro__)
             category = "多变量检测器" if "HD" in cls.__name__ or cls.__name__ in ["MinClusterDetector", "OutlierDetector", "PcaAD", "RegressionAD"] else "单变量检测器"
             
             # 构建检测器信息
@@ -142,13 +145,13 @@ class ADTKServer(Server):
         }
         return scenarios.get(class_name, "通用异常检测方法")
     
-    @mcp_tool("IQR异常检测")
+    @mcptool("IQR异常检测", "使用IQR方法进行异常检测")
     async def detect_with_iqr(self, data: str, params: str) -> str:
         """使用IQR方法进行异常检测
         
         Args:
             data: JSON字符串，包含时间序列数据，格式为 {"series": [[timestamp, value], ...]}
-            params: JSON字符串，包含检测参数，如 {"c": 3.0, "weight": 0.5}
+            params: JSON字符串，包含检测参数，如 {"c": 3.0}
             
         Returns:
             检测结果的JSON字符串
@@ -199,15 +202,16 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"IQR检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"IQR检测失败: {str(e)}"})
     
-    @mcp_tool("广义ESD检测")
+    @mcptool("广义ESD检测", "使用广义ESD检验进行异常检测")
     async def detect_with_esd(self, data: str, params: str) -> str:
         """使用广义ESD检验进行异常检测
         
         Args:
             data: JSON字符串，包含时间序列数据，格式为 {"series": [[timestamp, value], ...]}
-            params: JSON字符串，包含检测参数，如 {"alpha": 0.05, "weight": 0.6}
+            params: JSON字符串，包含检测参数，如 {"alpha": 0.05}
             
         Returns:
             检测结果的JSON字符串
@@ -258,15 +262,16 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"ESD检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"ESD检测失败: {str(e)}"})
     
-    @mcp_tool("分位数异常检测")
+    @mcptool("分位数异常检测", "使用分位数方法进行异常检测")
     async def detect_with_quantile(self, data: str, params: str) -> str:
         """使用分位数方法进行异常检测
         
         Args:
             data: JSON字符串，包含时间序列数据，格式为 {"series": [[timestamp, value], ...]}
-            params: JSON字符串，包含检测参数，如 {"low": 0.05, "high": 0.95, "weight": 0.4}
+            params: JSON字符串，包含检测参数，如 {"low": 0.05, "high": 0.95}
             
         Returns:
             检测结果的JSON字符串
@@ -318,15 +323,16 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"分位数检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"分位数检测失败: {str(e)}"})
     
-    @mcp_tool("阈值异常检测")
+    @mcptool("阈值异常检测", "使用固定阈值进行异常检测")
     async def detect_with_threshold(self, data: str, params: str) -> str:
         """使用固定阈值进行异常检测
         
         Args:
             data: JSON字符串，包含时间序列数据，格式为 {"series": [[timestamp, value], ...]}
-            params: JSON字符串，包含检测参数，如 {"low": 10, "high": 90, "weight": 0.3}
+            params: JSON字符串，包含检测参数，如 {"low": 10, "high": 90}
             
         Returns:
             检测结果的JSON字符串
@@ -378,15 +384,16 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"阈值检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"阈值检测失败: {str(e)}"})
     
-    @mcp_tool("持续性异常检测")
+    @mcptool("持续性异常检测", "使用持续性检测方法进行异常检测")
     async def detect_with_persist(self, data: str, params: str) -> str:
         """使用持续性检测方法进行异常检测
         
         Args:
             data: JSON字符串，包含时间序列数据，格式为 {"series": [[timestamp, value], ...]}
-            params: JSON字符串，包含检测参数，如 {"window": 5, "c": 3.0, "side": "both", "weight": 0.5}
+            params: JSON字符串，包含检测参数，如 {"window": 5, "c": 3.0, "side": "both"}
             
         Returns:
             检测结果的JSON字符串
@@ -400,6 +407,8 @@ class ADTKServer(Server):
             window = params_dict.get("window", 1)
             c = params_dict.get("c", 3.0)
             side = params_dict.get("side", "both")
+            min_periods = params_dict.get("min_periods", None)
+            agg = params_dict.get("agg", "median")
             weight = params_dict.get("weight", DEFAULT_WEIGHTS.get("PersistAD", 0.5))
             
             # 转换为pandas Series
@@ -408,7 +417,7 @@ class ADTKServer(Server):
             ts = pd.Series(values, index=pd.to_datetime(timestamps, unit='s'))
             
             # 创建检测器
-            detector = PersistAD(window=window, c=c, side=side)
+            detector = PersistAD(window=window, c=c, side=side, min_periods=min_periods, agg=agg)
             
             # 进行检测
             anomalies = detector.fit_detect(ts)
@@ -433,6 +442,8 @@ class ADTKServer(Server):
                     "window": window,
                     "c": c,
                     "side": side,
+                    "min_periods": min_periods,
+                    "agg": agg,
                     "weight": weight
                 },
                 "total_points": len(series_data),
@@ -444,15 +455,16 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"持续性检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"持续性检测失败: {str(e)}"})
     
-    @mcp_tool("水平位移检测")
+    @mcptool("水平位移检测", "使用水平位移检测方法进行异常检测")
     async def detect_with_level_shift(self, data: str, params: str) -> str:
         """使用水平位移检测方法进行异常检测
         
         Args:
             data: JSON字符串，包含时间序列数据，格式为 {"series": [[timestamp, value], ...]}
-            params: JSON字符串，包含检测参数，如 {"window": 5, "c": 6.0, "side": "both", "weight": 0.6}
+            params: JSON字符串，包含检测参数，如 {"window": 5, "c": 6.0, "side": "both"}
             
         Returns:
             检测结果的JSON字符串
@@ -466,6 +478,7 @@ class ADTKServer(Server):
             window = params_dict.get("window", 5)
             c = params_dict.get("c", 6.0)
             side = params_dict.get("side", "both")
+            min_periods = params_dict.get("min_periods", None)
             weight = params_dict.get("weight", DEFAULT_WEIGHTS.get("LevelShiftAD", 0.6))
             
             # 转换为pandas Series
@@ -474,7 +487,7 @@ class ADTKServer(Server):
             ts = pd.Series(values, index=pd.to_datetime(timestamps, unit='s'))
             
             # 创建检测器
-            detector = LevelShiftAD(window=window, c=c, side=side)
+            detector = LevelShiftAD(window=window, c=c, side=side, min_periods=min_periods)
             
             # 进行检测
             anomalies = detector.fit_detect(ts)
@@ -499,6 +512,7 @@ class ADTKServer(Server):
                     "window": window,
                     "c": c,
                     "side": side,
+                    "min_periods": min_periods,
                     "weight": weight
                 },
                 "total_points": len(series_data),
@@ -510,15 +524,16 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"水平位移检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"水平位移检测失败: {str(e)}"})
     
-    @mcp_tool("波动性变化检测")
+    @mcptool("波动性变化检测", "使用波动性变化检测方法进行异常检测")
     async def detect_with_volatility_shift(self, data: str, params: str) -> str:
         """使用波动性变化检测方法进行异常检测
         
         Args:
             data: JSON字符串，包含时间序列数据，格式为 {"series": [[timestamp, value], ...]}
-            params: JSON字符串，包含检测参数，如 {"window": 10, "c": 6.0, "side": "both", "weight": 0.5}
+            params: JSON字符串，包含检测参数，如 {"window": 10, "c": 6.0, "side": "both", "agg": "std"}
             
         Returns:
             检测结果的JSON字符串
@@ -532,6 +547,7 @@ class ADTKServer(Server):
             window = params_dict.get("window", 10)
             c = params_dict.get("c", 6.0)
             side = params_dict.get("side", "both")
+            min_periods = params_dict.get("min_periods", None)
             agg = params_dict.get("agg", "std")
             weight = params_dict.get("weight", DEFAULT_WEIGHTS.get("VolatilityShiftAD", 0.5))
             
@@ -541,7 +557,7 @@ class ADTKServer(Server):
             ts = pd.Series(values, index=pd.to_datetime(timestamps, unit='s'))
             
             # 创建检测器
-            detector = VolatilityShiftAD(window=window, c=c, side=side, agg=agg)
+            detector = VolatilityShiftAD(window=window, c=c, side=side, min_periods=min_periods, agg=agg)
             
             # 进行检测
             anomalies = detector.fit_detect(ts)
@@ -566,6 +582,7 @@ class ADTKServer(Server):
                     "window": window,
                     "c": c,
                     "side": side,
+                    "min_periods": min_periods,
                     "agg": agg,
                     "weight": weight
                 },
@@ -578,15 +595,16 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"波动性变化检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"波动性变化检测失败: {str(e)}"})
     
-    @mcp_tool("季节性异常检测")
+    @mcptool("季节性异常检测", "使用季节性异常检测方法进行异常检测")
     async def detect_with_seasonal(self, data: str, params: str) -> str:
         """使用季节性异常检测方法进行异常检测
         
         Args:
             data: JSON字符串，包含时间序列数据，格式为 {"series": [[timestamp, value], ...]}
-            params: JSON字符串，包含检测参数，如 {"freq": 24, "c": 3.0, "trend": false, "weight": 0.7}
+            params: JSON字符串，包含检测参数，如 {"freq": 24, "c": 3.0, "side": "both", "trend": false}
             
         Returns:
             检测结果的JSON字符串
@@ -624,8 +642,8 @@ class ADTKServer(Server):
                     value = float(ts[idx])
                     anomaly_timestamps.append(timestamp)
                     anomaly_values.append(value)
-
-                     # 准备结果
+            
+            # 准备结果
             result = {
                 "method": "SeasonalAD",
                 "anomalies": anomaly_timestamps,
@@ -646,15 +664,16 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"季节性检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"季节性检测失败: {str(e)}"})
     
-    @mcp_tool("自回归异常检测")
+    @mcptool("自回归异常检测", "使用自回归异常检测方法进行异常检测")
     async def detect_with_autoregression(self, data: str, params: str) -> str:
         """使用自回归异常检测方法进行异常检测
         
         Args:
             data: JSON字符串，包含时间序列数据，格式为 {"series": [[timestamp, value], ...]}
-            params: JSON字符串，包含检测参数，如 {"n_steps": 1, "c": 3.0, "side": "both", "weight": 0.5}
+            params: JSON字符串，包含检测参数，如 {"n_steps": 1, "c": 3.0, "side": "both"}
             
         Returns:
             检测结果的JSON字符串
@@ -666,8 +685,10 @@ class ADTKServer(Server):
             
             series_data = data_dict.get("series", [])
             n_steps = params_dict.get("n_steps", 1)
+            step_size = params_dict.get("step_size", 1)
             c = params_dict.get("c", 3.0)
             side = params_dict.get("side", "both")
+            regressor = params_dict.get("regressor")  # 默认为None，使用线性回归
             weight = params_dict.get("weight", DEFAULT_WEIGHTS.get("AutoregressionAD", 0.5))
             
             # 转换为pandas Series
@@ -676,7 +697,7 @@ class ADTKServer(Server):
             ts = pd.Series(values, index=pd.to_datetime(timestamps, unit='s'))
             
             # 创建检测器
-            detector = AutoregressionAD(n_steps=n_steps, c=c, side=side)
+            detector = AutoregressionAD(n_steps=n_steps, step_size=step_size, c=c, side=side)
             
             # 进行检测
             anomalies = detector.fit_detect(ts)
@@ -699,6 +720,7 @@ class ADTKServer(Server):
                 "anomaly_values": anomaly_values,
                 "parameters": {
                     "n_steps": n_steps,
+                    "step_size": step_size,
                     "c": c,
                     "side": side,
                     "weight": weight
@@ -712,15 +734,16 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"自回归检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"自回归检测失败: {str(e)}"})
     
-    @mcp_tool("最小聚类异常检测")
+    @mcptool("最小聚类异常检测", "使用最小聚类异常检测方法进行异常检测")
     async def detect_with_min_cluster(self, data: str, params: str) -> str:
         """使用最小聚类异常检测方法进行异常检测（多变量检测）
         
         Args:
             data: JSON字符串，包含多变量时间序列数据，格式为 {"series": [{"timestamp": t, "features": [v1, v2, ...]}, ...]}
-            params: JSON字符串，包含检测参数，如 {"n_clusters": 2, "weight": 0.4}
+            params: JSON字符串，包含检测参数，如 {"n_clusters": 2}
             
         Returns:
             检测结果的JSON字符串
@@ -772,15 +795,16 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"最小聚类检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"最小聚类检测失败: {str(e)}"})
     
-    @mcp_tool("离群值异常检测")
+    @mcptool("离群值异常检测", "使用离群值检测方法进行异常检测")
     async def detect_with_outlier(self, data: str, params: str) -> str:
         """使用离群值检测方法进行异常检测（多变量检测）
         
         Args:
             data: JSON字符串，包含多变量时间序列数据，格式为 {"series": [{"timestamp": t, "features": [v1, v2, ...]}, ...]}
-            params: JSON字符串，包含检测参数，如 {"contamination": 0.05, "weight": 0.5}
+            params: JSON字符串，包含检测参数，如 {"contamination": 0.05}
             
         Returns:
             检测结果的JSON字符串
@@ -832,15 +856,16 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"离群值检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"离群值检测失败: {str(e)}"})
     
-    @mcp_tool("PCA异常检测")
+    @mcptool("PCA异常检测", "使用PCA进行异常检测")
     async def detect_with_pca(self, data: str, params: str) -> str:
         """使用PCA进行异常检测（多变量检测）
         
         Args:
             data: JSON字符串，包含多变量时间序列数据，格式为 {"series": [{"timestamp": t, "features": [v1, v2, ...]}, ...]}
-            params: JSON字符串，包含检测参数，如 {"k": 1, "c": 5.0, "weight": 0.6}
+            params: JSON字符串，包含检测参数，如 {"k": 1, "c": 5.0}
             
         Returns:
             检测结果的JSON字符串
@@ -890,15 +915,16 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"PCA检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"PCA检测失败: {str(e)}"})
     
-    @mcp_tool("回归异常检测")
+    @mcptool("回归异常检测", "使用回归进行异常检测")
     async def detect_with_regression(self, data: str, params: str) -> str:
         """使用回归进行异常检测（多变量检测）
         
         Args:
             data: JSON字符串，包含多变量时间序列数据，格式为 {"series": [{"timestamp": t, "features": {"feature1": v1, "feature2": v2, ...}}, ...]}
-            params: JSON字符串，包含检测参数，如 {"target": "feature1", "c": 3.0, "side": "both", "weight": 0.5}
+            params: JSON字符串，包含检测参数，如 {"target": "feature1", "c": 3.0, "side": "both"}
             
         Returns:
             检测结果的JSON字符串
@@ -955,15 +981,23 @@ class ADTKServer(Server):
             
         except Exception as e:
             logger.error(f"回归检测错误: {str(e)}")
+            traceback.print_exc()
             return json.dumps({"error": f"回归检测失败: {str(e)}"})
 
 # 启动服务器的函数
 async def start_server(port=7777):
     """启动ADTK MCP服务器"""
-    server_params = ServerParameters(port=port)
-    server = ADTKServer(server_params)
-    await server.start()
-    return server
+    try:
+        server_params = MCPServerParameters(port=port)
+        server = ADTKServer(server_params)
+        
+        logger.info(f"启动ADTK MCP服务器，端口: {port}")
+        await server.start()
+        return server
+    except Exception as e:
+        logger.error(f"启动ADTK MCP服务器失败: {e}")
+        traceback.print_exc()
+        return None
 
 if __name__ == "__main__":
     import asyncio
@@ -972,15 +1006,22 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         port = int(sys.argv[1])
     
-    print(f"启动ADTK MCP服务器，端口: {port}")
-    
+    # 创建事件循环
     loop = asyncio.get_event_loop()
-    server = loop.run_until_complete(start_server(port))
     
+    # 启动服务器
+    server = None
     try:
-        loop.run_forever()
+        server = loop.run_until_complete(start_server(port))
+        if server:
+            # 保持服务器运行
+            loop.run_forever()
     except KeyboardInterrupt:
-        print("关闭服务器...")
+        logger.info("接收到终止信号，准备关闭服务器...")
     finally:
-        loop.run_until_complete(server.stop())
+        # 关闭服务器
+        if server:
+            loop.run_until_complete(server.stop())
+        
+        # 关闭事件循环
         loop.close()

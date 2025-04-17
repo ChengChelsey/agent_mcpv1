@@ -21,7 +21,6 @@ from output.report_generator import generate_report_single, generate_report_mult
 from output.visualization import generate_summary_echarts_html
 from utils.ts_cache import ensure_cache_file, load_series_from_cache
 from utils.time_utils import parse_time_expressions
-from utils.ts_features import series_features
 from utils.ts_features import analyze_time_series_features, select_detection_methods
 
 # MCP客户端
@@ -351,9 +350,17 @@ async def select_best_detection_methods(features, detector_info):
         print(f"选择检测方法错误: {e}")
         traceback.print_exc()
         return {"error": f"选择检测方法失败: {str(e)}"}
-
 async def execute_detection(method, series_data, params):
-    """执行异常检测"""
+    """执行异常检测
+    
+    Args:
+        method: 检测方法名称，如 "IQR异常检测"
+        series_data: 时间序列数据
+        params: 检测参数
+    
+    Returns:
+        检测结果
+    """
     try:
         # 准备数据
         data = {"series": series_data}
@@ -364,11 +371,16 @@ async def execute_detection(method, series_data, params):
         # 执行检测
         result = await client.detect_anomalies(method, data, params)
         
+        # 检查是否有错误
+        if isinstance(result, dict) and "error" in result:
+            logger.error(f"检测错误: {result['error']}")
+            return {"error": result["error"], "method": method}
+        
         return result
     except Exception as e:
-        print(f"执行异常检测错误: {e}")
+        logger.error(f"执行异常检测错误: {e}")
         traceback.print_exc()
-        return {"error": f"执行异常检测失败: {str(e)}"}
+        return {"error": f"执行异常检测失败: {str(e)}", "method": method}
 
 def calculate_composite_score(detection_results):
     """计算综合异常评分"""

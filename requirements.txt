@@ -14,8 +14,8 @@ requests>=2.25.0
 # Django依赖（用于配置）
 django>=3.2.0
 
-# MCP客户端
-mcp>=0.1.0
+# MCP客户端 - 使用最新版本
+mcp==1.6.0
 
 # ADTK异常检测
 adtk>=0.6.2

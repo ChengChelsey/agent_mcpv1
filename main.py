@@ -25,16 +25,27 @@ def start_adtk_server(port=7777):
     """启动ADTK MCP服务器进程"""
     logger.info(f"启动ADTK MCP服务器，端口: {port}")
     
+    # 确保模块可以被找到
+    server_path = os.path.abspath("adtk_server.py")
+    if not os.path.exists(server_path):
+        logger.error(f"找不到服务器文件: {server_path}")
+        return None
+    
+    # 设置环境变量以确保能找到正确的模块
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.path.dirname(os.path.abspath(__file__)) + ":" + env.get("PYTHONPATH", "")
+    
     # 使用subprocess启动服务器进程
     server_process = subprocess.Popen(
-        ["python", "adtk_server.py", str(port)],
+        [sys.executable, server_path, str(port)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        universal_newlines=True
+        universal_newlines=True,
+        env=env
     )
     
     # 等待服务器启动
-    time.sleep(2)
+    time.sleep(5)  # 给MCP服务器更多启动时间
     
     # 检查服务器是否成功启动
     if server_process.poll() is not None:
@@ -51,7 +62,7 @@ async def check_mcp_connection():
     try:
         client = await get_mcp_client()
         detector_info = await client.get_all_detectors()
-        if "error" in detector_info:
+        if isinstance(detector_info, dict) and "error" in detector_info:
             logger.error(f"MCP连接检查失败: {detector_info['error']}")
             return False
         logger.info("MCP连接检查成功")
@@ -85,7 +96,6 @@ def signal_handler(sig, frame):
     """信号处理函数"""
     print("\n接收到终止信号，准备退出系统...")
     sys.exit(0)
-
 async def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="时序异常检测系统")

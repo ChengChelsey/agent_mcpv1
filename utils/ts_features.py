@@ -88,10 +88,6 @@ def analyze_time_series_features(series_data: List[List]) -> Dict:
         features["偏度"] = skewness  # 正值表示右偏，负值表示左偏
         features["峰度"] = kurtosis  # 正值表示尖峰，负值表示平坦
         
-        # 根据特征推荐适合的检测方法
-        recommended_methods = recommend_detection_methods(features)
-        features["推荐检测方法"] = recommended_methods
-        
         return features
         
     except Exception as e:
@@ -313,73 +309,171 @@ def select_detection_methods(features: Dict, detector_info: Dict) -> List[Dict]:
     Returns:
         选定的异常检测方法列表，包含方法名称、参数和权重
     """
-    # 首先获取推荐方法
-    recommended = recommend_detection_methods(features)
     selected_methods = []
     
-    # 映射方法名称到ADTK方法
-    method_mapping = {
-        "IQR异常检测": "IQR异常检测",
-        "广义ESD检测": "广义ESD检测",
-        "分位数异常检测": "分位数异常检测",
-        "阈值异常检测": "阈值异常检测",
-        "持续性异常检测": "持续性异常检测",
-        "水平位移检测": "水平位移检测",
-        "波动性变化检测": "波动性变化检测",
-        "季节性异常检测": "季节性异常检测",
-        "自回归异常检测": "自回归异常检测",
-    }
+    # 获取单变量检测器信息
+    single_var_detectors = detector_info.get("单变量检测器", [])
     
-    # 方法参数推荐
-    method_params = {}
+    # 根据特征提取重要信息
+    data_length = features.get("长度", 0)
+    is_stationary = features.get("平稳性", False)
+    has_seasonality = features.get("季节性", False)
+    seasonality_period = features.get("季节周期")
+    has_trend = features.get("趋势", False)
+    volatility = features.get("波动性描述", "中")
+    auto_corr = features.get("自相关系数(lag=1)", 0)
+    outlier_ratio = features.get("异常值比例估计", 0)
     
-    # 根据特征设置适当的参数
-    # IQR参数
-    iqr_c = 3.0
-    if features.get("异常值比例估计", 0) > 0.05:
-        iqr_c = 4.0  # 异常值比例高时，提高阈值减少误报
-    method_params["IQR异常检测"] = {"c": iqr_c}
+    # 定义权重和选择条件
+    detector_scores = {}
     
-    # 季节性检测参数
-    season_period = features.get("季节周期")
-    if season_period:
-        method_params["季节性异常检测"] = {"freq": season_period}
-    
-    # 波动性检测参数
-    volatility = features.get("波动性指数", 0)
-    if volatility > 0.5:
-        method_params["波动性变化检测"] = {"window": 8, "c": 5.0}  # 高波动性时，减小窗口，提高阈值
-    else:
-        method_params["波动性变化检测"] = {"window": 12, "c": 6.0}  # 低波动性时，增大窗口
-    
-    # 为每个推荐方法添加参数和权重
-    for rec in recommended:
-        method_name = rec["方法"]
-        if method_name in method_mapping:
-            adtk_method = method_mapping[method_name]
+    # 对每个检测器评分
+    for detector in single_var_detectors:
+        score = 0.0
+        method_name = detector.get("类名", "")
+        
+        # 根据特征对每个方法进行评分
+        if method_name == "InterQuartileRangeAD":
+            # IQR方法适用于大多数情况
+            score = 0.7
             
-            # 设置方法的默认参数
-            params = method_params.get(method_name, {})
+        elif method_name == "GeneralizedESDTestAD":
+            # 广义ESD方法适用于平稳数据
+            score = 0.5
+            if is_stationary:
+                score += 0.3
             
-            # 添加权重
-            weight = 0.5  # 默认权重
-            if method_name == "IQR异常检测":
-                weight = 0.5
-            elif method_name == "广义ESD检测":
-                weight = 0.6
-            elif method_name == "季节性异常检测" and features.get("季节性", False):
-                weight = 0.7  # 如果数据确实具有季节性，提高权重
-            elif method_name == "自回归异常检测" and features.get("自相关系数(lag=1)", 0) > 0.7:
-                weight = 0.6  # 强自相关时，提高自回归权重
+        elif method_name == "QuantileAD":
+            # 分位数方法适用于有明显异常的数据
+            score = 0.4
+            if outlier_ratio > 0.01:
+                score += 0.3
             
-            # 添加权重参数
-            params["weight"] = weight
+        elif method_name == "ThresholdAD":
+            # 阈值方法适用于有明确阈值的数据
+            score = 0.3  # 默认较低分数，因为需要人工设置阈值
             
-            # 添加到选定方法列表
-            selected_methods.append({
-                "方法名称": adtk_method,
-                "参数": params,
-                "理由": rec["理由"]
-            })
+        elif method_name == "PersistAD":
+            # 持续性方法适用于有自相关性的数据
+            score = 0.4
+            if auto_corr > 0.3:
+                score += 0.3
+                
+        elif method_name == "LevelShiftAD":
+            # 水平位移方法适用于有趋势的数据
+            score = 0.4
+            if has_trend:
+                score += 0.3
+                
+        elif method_name == "VolatilityShiftAD":
+            # 波动性变化方法适用于高波动性数据
+            score = 0.3
+            if volatility == "高":
+                score += 0.4
+                
+        elif method_name == "SeasonalAD":
+            # 季节性方法适用于有季节性的数据
+            score = 0.3
+            if has_seasonality:
+                score += 0.5
+                
+        elif method_name == "AutoregressionAD":
+            # 自回归方法适用于强自相关数据
+            score = 0.3
+            if auto_corr > 0.5:
+                score += 0.4
+        
+        # 数据长度不足时减分
+        if data_length < 30 and method_name in ["SeasonalAD", "AutoregressionAD", "VolatilityShiftAD"]:
+            score -= 0.3
+        
+        # 记录评分
+        detector_scores[method_name] = score
+    
+    # 选择评分最高的3-5个方法
+    sorted_detectors = sorted(detector_scores.items(), key=lambda x: x[1], reverse=True)
+    top_detectors = sorted_detectors[:min(5, len(sorted_detectors))]
+    
+    # 确保至少有3个方法（如果可能）
+    if len(top_detectors) < 3 and len(sorted_detectors) >= 3:
+        top_detectors = sorted_detectors[:3]
+    
+    # 构建方法参数
+    for method_name, score in top_detectors:
+        # 跳过评分太低的方法
+        if score < 0.3:
+            continue
+            
+        # 设置方法的默认参数
+        params = {}
+        
+        # 根据特征设置适当的参数
+        if method_name == "InterQuartileRangeAD":
+            c = 3.0
+            if outlier_ratio > 0.05:
+                c = 4.0  # 异常值比例高时，提高阈值减少误报
+            params = {"c": c}
+            
+        elif method_name == "GeneralizedESDTestAD":
+            params = {"alpha": 0.05}
+            
+        elif method_name == "QuantileAD":
+            params = {"low": 0.05, "high": 0.95}
+            
+        elif method_name == "ThresholdAD":
+            # 使用中位数和IQR估计合适的阈值
+            median = features.get("中位数", 0)
+            iqr = features.get("四分位距", 1)
+            params = {
+                "low": median - 3 * iqr if iqr > 0 else None,
+                "high": median + 3 * iqr if iqr > 0 else None
+            }
+            
+        elif method_name == "PersistAD":
+            window = 5 if data_length > 50 else 3
+            params = {"window": window, "c": 3.0, "side": "both"}
+            
+        elif method_name == "LevelShiftAD":
+            window = 10 if data_length > 100 else 5
+            params = {"window": window, "c": 6.0, "side": "both"}
+            
+        elif method_name == "VolatilityShiftAD":
+            window = 15 if data_length > 150 else 10
+            params = {"window": window, "c": 6.0, "side": "both", "agg": "std"}
+            
+        elif method_name == "SeasonalAD":
+            freq = seasonality_period if seasonality_period else None
+            params = {"freq": freq, "c": 3.0, "trend": has_trend}
+            
+        elif method_name == "AutoregressionAD":
+            n_steps = 3 if auto_corr > 0.7 else 1
+            params = {"n_steps": n_steps, "c": 3.0, "side": "both"}
+        
+        # 添加权重
+        params["weight"] = score
+        
+        # 添加到选定方法列表
+        for detector in single_var_detectors:
+            if detector.get("类名") == method_name:
+                method_display_name = next((name for name, m in {
+                    "IQR异常检测": "InterQuartileRangeAD",
+                    "广义ESD检测": "GeneralizedESDTestAD",
+                    "分位数异常检测": "QuantileAD",
+                    "阈值异常检测": "ThresholdAD",
+                    "持续性异常检测": "PersistAD",
+                    "水平位移检测": "LevelShiftAD",
+                    "波动性变化检测": "VolatilityShiftAD",
+                    "季节性异常检测": "SeasonalAD",
+                    "自回归异常检测": "AutoregressionAD"
+                }.items() if m == method_name), method_name)
+                
+                selected_methods.append({
+                    "方法名称": method_display_name,
+                    "类名": method_name,
+                    "参数": params,
+                    "理由": detector.get("适用场景", ""),
+                    "评分": score
+                })
+                break
     
     return selected_methods
