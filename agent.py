@@ -732,51 +732,61 @@ def react(llm_text):
         return final_ans, is_final
     return ("格式不符合要求，必须使用：<思考过程></思考过程> <工具调用></工具调用> <调用参数></调用参数> <最终答案></最终答案>", is_final)
 
+def _to_builtin(x):
+    if isinstance(x, dict):
+        return {k: _to_builtin(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_to_builtin(v) for v in x]
+    if isinstance(x, (np.generic,)):          # numpy 标量 → builtin
+        return x.item()
+    return x
+
 def shorten_tool_result(res):
+    """
+    将工具返回值做简要摘要，避免往 LLM 里写入过大的内容。
+    现在支持自动把 numpy.* 标量转换为 json 可序列化的 builtin。
+    """
+    res = _to_builtin(res)  # ★ 先做通用转换
+
     if isinstance(res, list):
-        if len(res) > 0 and isinstance(res[0], dict) and "start" in res[0] and "end" in res[0]:
+        # 特殊：解析时间表达式的结果
+        if res and isinstance(res[0], dict) and "start" in res[0] and "end" in res[0]:
             for item in res:
                 if "error" not in item or not item["error"]:
                     if "start_str" not in item:
-                        start_dt = datetime.datetime.fromtimestamp(item["start"])
-                        item["start_str"] = start_dt.strftime("%Y-%m-%d %H:%M:%S") 
+                        item["start_str"] = datetime.datetime.fromtimestamp(item["start"]).strftime("%Y-%m-%d %H:%M:%S")
                     if "end_str" not in item:
-                        end_dt = datetime.datetime.fromtimestamp(item["end"])
-                        item["end_str"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-            
-            #一个简单的的摘要
-            time_results = []
-            for item in res:
-                if "error" in item and item["error"]:
-                    time_results.append({"error": item["error"]})
-                else:
-                    time_results.append({
-                        "start_time": item.get("start_str", ""),
-                        "end_time": item.get("end_str", ""),
-                        "start": item.get("start", 0),
-                        "end": item.get("end", 0)
-                    })
+                        item["end_str"] = datetime.datetime.fromtimestamp(item["end"]).strftime("%Y-%m-%d %H:%M:%S")
+            time_results = [
+                {"start_time": it.get("start_str",""), "end_time": it.get("end_str",""),
+                 "start": it.get("start",0), "end": it.get("end",0)} if not it.get("error")
+                else {"error": it["error"]}
+                for it in res
+            ]
             return json.dumps(time_results, ensure_ascii=False)
+
+        # 长列表给出前后各 5 条
         if len(res) > 10:
             summary = {"总条目数": len(res), "前5条": res[:5], "后5条": res[-5:]}
             return json.dumps(summary, ensure_ascii=False, indent=2)
-            
         return json.dumps(res, ensure_ascii=False)
+
     elif isinstance(res, dict):
         summary = {}
-        for k,v in res.items():
+        for k, v in res.items():
             if isinstance(v, list):
                 summary[k] = f"[List len={len(v)}]"
-            elif isinstance(v, str) and len(v)>300:
+            elif isinstance(v, str) and len(v) > 300:
                 summary[k] = v[:300] + f"...(omitted, length={len(v)})"
             else:
                 summary[k] = v
         return json.dumps(summary, ensure_ascii=False)
-    elif isinstance(res, str) and len(res)>300:
+
+    elif isinstance(res, str) and len(res) > 300:
         return res[:300] + f"...(omitted, length={len(res)})"
     else:
         return str(res)
-
+    
 def chat(user_query):
     system_prompt = f'''你是一个严格遵守格式规范的用于运维功能，运维数据可视化，运行于生产环境的ReAct智能体，你叫小助手，必须按以下格式处理请求：
 

@@ -34,9 +34,12 @@ from sklearn.linear_model import LinearRegression
 
 from mcp.server.fastmcp import FastMCP
 
-# 配置日志
-logging.basicConfig(level=logging.DEBUG, 
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+import sys, logging
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stderr,          # ★ 关键：写 stderr，别污染 stdout
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger("adtk_server")
 
 # 创建MCP服务器实例
@@ -172,23 +175,17 @@ def ping() -> str:
 # ---------------------------------------------------------------------------
 # 运行入口
 # ---------------------------------------------------------------------------
-
 def main():
-    parser = argparse.ArgumentParser(description="Run ADTK FastMCP server")
-    parser.add_argument("--port", type=int, default=7777)
+    import argparse, logging
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=7777,
+                        help="HTTP 端口（客户端也要用同一端口）")
     args = parser.parse_args()
-    
-    logger.info(f"正在初始化ADTK FastMCP服务器，端口: {args.port}")
-    
-    # 使用最简单的方式启动服务器
-    logger.info("开始启动服务器...")
-    try:
-        # 不传递任何参数
-        mcp.run()
-    except Exception as e:
-        logger.error(f"服务器运行错误: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+
+    logging.getLogger("adtk_server").info("启动 FastMCP (HTTP-SSE) 端口 %d", args.port)
+    from mcp.server.fastmcp import FastMCP
+    FastMCP._default_port = args.port          # 强制端口
+    mcp.run()                                  # 保持原写法
 
 if __name__ == "__main__":
-    main()
+    mcp.run()    
