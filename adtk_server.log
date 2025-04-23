@@ -1,6 +1,0 @@
-Traceback (most recent call last):
-  File "/mnt/data/aiagent-ts/adtk_server.py", line 123, in <module>
-    main()
-  File "/mnt/data/aiagent-ts/adtk_server.py", line 117, in main
-    app.include_router(mcp.router, prefix="/v1")
-AttributeError: 'FastMCP' object has no attribute 'router'

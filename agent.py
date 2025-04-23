@@ -346,7 +346,7 @@ async def get_detection_methods():
     """从MCP服务器获取异常检测方法信息"""
     try:
         client = await get_mcp_client()
-        detector_info = await client.get_all_detectors()
+        detector_info = await client.list_detectors()
         return detector_info
     except Exception as e:
         logger.error(f"获取检测方法信息错误: {e}")
@@ -374,7 +374,7 @@ async def execute_detection(method, series_data, params):
         检测结果
     """
     try:
-        # 获取MCP客户端 (只获取一次)
+        # 获取MCP客户端
         client = await get_mcp_client()
         
         # 执行检测
@@ -390,7 +390,16 @@ async def execute_detection(method, series_data, params):
         logger.error(f"执行异常检测错误: {e}")
         traceback.print_exc()
         return {"error": f"执行异常检测失败: {str(e)}", "method": method}
-    
+
+async def cleanup_mcp_resources():
+    """清理MCP资源"""
+    try:
+        client = await get_mcp_client()
+        await client.close()
+        logger.info("MCP资源已清理")
+    except Exception as e:
+        logger.error(f"清理MCP资源出错: {e}")
+
 def calculate_composite_score(detection_results):
     """计算综合异常评分"""
     try:
@@ -888,6 +897,14 @@ def chat(user_query):
         if round_num>max_round:
             print("超出上限")
             return
+    
+    try:
+        # 最终返回结果前，确保清理MCP资源
+        asyncio.create_task(cleanup_mcp_resources())
+    except Exception as e:
+        logger.error(f"创建清理任务失败: {e}")
+    
+    return result  
 
 if __name__ == '__main__':
     # chat('你好')
