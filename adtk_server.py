@@ -1,15 +1,18 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ADTK FastMCP Server
+from __future__ import annotations
+
+"""ADTK FastMCP Server
 
 全部 ADTK 检测器自动注册为 MCP tool，
 并新增统一入口 `获取所有检测方法信息` 供 LLM 一次性获取元数据。
 需依赖 mcp>=1.6。
 """
-from __future__ import annotations
 import json
 from typing import Any, Callable, Dict, List, Tuple
 import argparse
 import pandas as pd
+import logging
 from adtk.detector import (
     AutoregressionAD,
     GeneralizedESDTestAD,
@@ -31,6 +34,12 @@ from sklearn.linear_model import LinearRegression
 
 from mcp.server.fastmcp import FastMCP
 
+# 配置日志
+logging.basicConfig(level=logging.DEBUG, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("adtk_server")
+
+# 创建MCP服务器实例
 mcp = FastMCP("adtk-server")
 
 # ---------------------------------------------------------------------------
@@ -87,11 +96,14 @@ def _register_univariate(det_cls, tool_name, description, default_kwargs=None):
 
     @mcp.tool(name=tool_name, description=description)
     def _tool(series: List[Tuple[int, float]], **kwargs):
+        logger.info(f"正在执行 {tool_name} 检测")
         params = {**default_kwargs, **kwargs}
         ts = _list_to_series(series)
         det = det_cls(**params)
         events = det.detect(ts, return_list=True)
-        return _wrap(det_cls.__name__, events, values=ts.values)
+        result = _wrap(det_cls.__name__, events, len(ts))
+        logger.info(f"{tool_name} 检测完成")
+        return result
 
     DETECTOR_META[tool_name] = {
         "category": "univariate",
@@ -105,12 +117,15 @@ def _register_multivariate(factory: Callable, tool_name, description, default_kw
 
     @mcp.tool(name=tool_name, description=description)
     def _tool(series: List[Dict[str, Any]], **kwargs):
+        logger.info(f"正在执行 {tool_name} 检测")
         params = {**default_kwargs, **kwargs}
         idx = pd.to_datetime([d["timestamp"] for d in series], unit="s")
         df = pd.DataFrame([d["features"] for d in series], index=idx)
         det = factory(params)
         events = det.detect(df, return_list=True)
-        return _wrap(det.__class__.__name__, events)
+        result = _wrap(det.__class__.__name__, events, len(df))
+        logger.info(f"{tool_name} 检测完成")
+        return result
 
     DETECTOR_META[tool_name] = {
         "category": "multivariate",
@@ -145,18 +160,35 @@ _register_multivariate(lambda p: RegressionAD(target=p["target"], regressor=Line
 # ---------------------------------------------------------------------------
 @mcp.tool(name="获取所有检测方法信息", description="列出所有 ADTK 检测器元数据")
 def get_all_detectors() -> Dict[str, Any]:
+    logger.info("调用获取所有检测方法信息")
     return DETECTOR_META
+
+# 添加简单的测试工具
+@mcp.tool(name="ping", description="测试MCP连接")
+def ping() -> str:
+    logger.info("收到ping请求")
+    return "pong from ADTK server"
 
 # ---------------------------------------------------------------------------
 # 运行入口
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser("Run ADTK FastMCP server")
+    parser = argparse.ArgumentParser(description="Run ADTK FastMCP server")
     parser.add_argument("--port", type=int, default=7777)
     args = parser.parse_args()
-    mcp.run(port=args.port)
-
+    
+    logger.info(f"正在初始化ADTK FastMCP服务器，端口: {args.port}")
+    
+    # 使用最简单的方式启动服务器
+    logger.info("开始启动服务器...")
+    try:
+        # 不传递任何参数
+        mcp.run()
+    except Exception as e:
+        logger.error(f"服务器运行错误: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 if __name__ == "__main__":
     main()

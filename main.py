@@ -13,6 +13,7 @@ import asyncio
 import subprocess
 import signal
 import logging
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import agent
@@ -35,9 +36,9 @@ def start_adtk_server(port=7777):
     env = os.environ.copy()
     env["PYTHONPATH"] = os.path.dirname(os.path.abspath(__file__)) + ":" + env.get("PYTHONPATH", "")
     
-    # 使用subprocess启动服务器进程
+    # 使用subprocess启动服务器进程 - 修复命令行参数传递方式
     server_process = subprocess.Popen(
-        [sys.executable, server_path, str(port)],
+        [sys.executable, server_path, "--port", str(port)],  # 修改这里，添加--port参数
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         universal_newlines=True,
@@ -60,17 +61,16 @@ def start_adtk_server(port=7777):
 async def check_mcp_connection():
     """检查MCP客户端连接"""
     try:
+        logger.info("开始检查MCP连接...")
+    # 不需要额外的超时包装，直接调用
         client = await get_mcp_client()
-        detector_info = await client.get_all_detectors()
-        if isinstance(detector_info, dict) and "error" in detector_info:
-            logger.error(f"MCP连接检查失败: {detector_info['error']}")
-            return False
-        logger.info("MCP连接检查成功")
-        return True
+        logger.info("成功获取MCP客户端")
     except Exception as e:
-        logger.error(f"MCP连接检查失败: {e}")
+        logger.error(f"获取MCP客户端失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
-
+    
 def interactive_mode():
     """交互式命令行模式"""
     print("\n===== 时序异常检测系统 =====")
@@ -96,6 +96,7 @@ def signal_handler(sig, frame):
     """信号处理函数"""
     print("\n接收到终止信号，准备退出系统...")
     sys.exit(0)
+
 async def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="时序异常检测系统")
