@@ -10,6 +10,7 @@ import re
 import time
 import traceback
 from typing import Any, Dict
+from mcp_client import get_mcp_client
 
 import requests
 
@@ -340,7 +341,7 @@ async def analyze_ts_features(series_data):
         print(f"分析时序特征错误: {e}")
         traceback.print_exc()
         return {"error": f"分析时序特征失败: {str(e)}"}
-
+    
 async def get_detection_methods():
     """从MCP服务器获取异常检测方法信息"""
     try:
@@ -348,7 +349,7 @@ async def get_detection_methods():
         detector_info = await client.get_all_detectors()
         return detector_info
     except Exception as e:
-        print(f"获取检测方法信息错误: {e}")
+        logger.error(f"获取检测方法信息错误: {e}")
         traceback.print_exc()
         return {"error": f"获取检测方法信息失败: {str(e)}"}
 
@@ -373,14 +374,10 @@ async def execute_detection(method, series_data, params):
         检测结果
     """
     try:
-        # 准备数据
-        data = {"series": series_data}
-        
-        # 获取MCP客户端
+        # 获取MCP客户端 (只获取一次)
         client = await get_mcp_client()
         
         # 执行检测
-        client = await get_mcp_client()
         result = await client.detect(method, series_data, params)
         
         # 检查是否有错误
@@ -393,7 +390,7 @@ async def execute_detection(method, series_data, params):
         logger.error(f"执行异常检测错误: {e}")
         traceback.print_exc()
         return {"error": f"执行异常检测失败: {str(e)}", "method": method}
-
+    
 def calculate_composite_score(detection_results):
     """计算综合异常评分"""
     try:

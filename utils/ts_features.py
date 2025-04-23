@@ -1,479 +1,345 @@
+# utils/ts_features.py
 """
-时序数据特征分析工具
-
-实现时间序列数据特征的提取和分析功能。
+时序特征分析和检测方法选择
 """
-
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Any, Optional, Tuple, Union
-import json
-import logging
+from typing import List, Tuple, Dict, Any
 from scipy import stats
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.stattools import adfuller, acf, pacf
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("ts_features")
-
-def analyze_time_series_features(series_data: List[List]) -> Dict:
-    """分析时间序列数据的特征
+def analyze_time_series_features(series_data: List[List[float]]) -> Dict[str, Any]:
+    """
+    分析时序数据特征，包括：
+    - 基本统计量
+    - 趋势性
+    - 季节性
+    - 平稳性
+    - 异常值特征
     
     Args:
-        series_data: 时间序列数据，格式为 [[timestamp, value], ...]
+        series_data: 时序数据，格式为 [[timestamp, value], ...]
         
     Returns:
-        包含时间序列特征的字典
+        特征字典
     """
+    # 转换为pandas Series
+    timestamps = [item[0] for item in series_data]
+    values = [item[1] for item in series_data]
+    
+    # 检查数据是否为空
+    if not values:
+        return {"error": "输入数据为空"}
+    
+    # 创建pandas Series
+    ts = pd.Series(values, index=pd.to_datetime(timestamps, unit='s'))
+    
+    # 计算基本统计量
+    basic_stats = {
+        "length": len(ts),
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values)),
+        "min": float(np.min(values)),
+        "max": float(np.max(values)),
+        "median": float(np.median(values)),
+        "missing_values": int(np.isnan(values).sum()),
+    }
+    
+    # 计算偏度和峰度
+    basic_stats["skewness"] = float(stats.skew(values))
+    basic_stats["kurtosis"] = float(stats.kurtosis(values))
+    
+    # 计算平稳性
+    stationarity = {}
     try:
-        # 提取时间戳和值
-        timestamps = [item[0] for item in series_data]
-        values = [item[1] for item in series_data]
-        
-        # 创建Series用于分析
-        ts = pd.Series(values, index=timestamps)
-        
-        # 计算基本统计特征
-        features = {
-            "长度": len(ts),
-            "最小值": float(ts.min()),
-            "最大值": float(ts.max()),
-            "平均值": float(ts.mean()),
-            "中位数": float(ts.median()),
-            "标准差": float(ts.std()),
-            "四分位距": float(ts.quantile(0.75) - ts.quantile(0.25)),
-            "非空值比例": float((~ts.isna()).mean()),
-            "变异系数": float(ts.std() / ts.mean()) if ts.mean() != 0 else float('nan'),
+        adf_result = adfuller(values)
+        stationarity = {
+            "adf_statistic": float(adf_result[0]),
+            "adf_pvalue": float(adf_result[1]),
+            "is_stationary": adf_result[1] < 0.05,
         }
-        
-        # 检测平稳性
-        is_stationary = check_stationarity(ts)
-        features["平稳性"] = is_stationary
-        
-        # 检测季节性
-        has_seasonality, seasonality_period = check_seasonality(ts)
-        features["季节性"] = has_seasonality
-        if has_seasonality and seasonality_period is not None:
-            features["季节周期"] = seasonality_period
-        
-        # 检测趋势
-        has_trend, trend_strength = check_trend(ts)
-        features["趋势"] = has_trend
-        features["趋势强度"] = trend_strength
-        
-        # 检测波动性
-        volatility, volatility_description = calculate_volatility(ts)
-        features["波动性指数"] = volatility
-        features["波动性描述"] = volatility_description
-        
-        # 异常值初步检测
-        outlier_ratio = estimate_outlier_ratio(ts)
-        features["异常值比例估计"] = outlier_ratio
-        
-        # 计算一阶差分序列的统计特性（变化率特性）
-        if len(ts) > 1:
-            diff = ts.diff().dropna()
-            features["变化率统计"] = {
-                "平均变化率": float(diff.mean()),
-                "最大变化率": float(diff.max()),
-                "最小变化率": float(diff.min()),
-                "变化率标准差": float(diff.std())
-            }
-        
-        # 检测自相关性
-        autocorr_lag1 = calculate_autocorrelation(ts, 1)
-        features["自相关系数(lag=1)"] = autocorr_lag1
-        
-        # 数据分布特征
-        skewness = float(stats.skew(ts.dropna()))
-        kurtosis = float(stats.kurtosis(ts.dropna()))
-        features["偏度"] = skewness  # 正值表示右偏，负值表示左偏
-        features["峰度"] = kurtosis  # 正值表示尖峰，负值表示平坦
-        
-        return features
-        
-    except Exception as e:
-        logger.error(f"特征分析错误: {str(e)}")
-        return {"error": f"特征分析失败: {str(e)}"}
-
-def check_stationarity(ts: pd.Series) -> bool:
-    """检查时间序列是否平稳
+    except:
+        stationarity = {
+            "adf_statistic": None,
+            "adf_pvalue": None,
+            "is_stationary": False,
+        }
     
-    简单实现：通过比较前半部分和后半部分的均值和方差来判断
+    # 自相关性分析
+    autocorrelation = {}
+    try:
+        acf_values = acf(values, nlags=min(40, len(values)//2))
+        pacf_values = pacf(values, nlags=min(40, len(values)//2))
+        
+        # 判断是否有显著自相关
+        significant_acf = np.any(np.abs(acf_values[1:]) > 1.96/np.sqrt(len(values)))
+        
+        autocorrelation = {
+            "has_autocorrelation": significant_acf,
+            "acf_peak": float(np.max(np.abs(acf_values[1:]))),
+        }
+    except:
+        autocorrelation = {
+            "has_autocorrelation": False,
+            "acf_peak": 0.0,
+        }
+    
+    # 季节性检测
+    seasonality = {}
+    try:
+        # 重新采样为规则间隔数据
+        ts_regular = ts.resample('1min').mean().interpolate()
+        
+        # 尝试不同周期检测季节性
+        potential_periods = [
+            24,            # 每天24小时
+            24*7,          # 每周
+            24*30,         # 每月
+        ]
+        
+        max_strength = 0
+        best_period = None
+        
+        for period in potential_periods:
+            if len(ts_regular) >= period * 2:  # 至少需要两个完整周期
+                try:
+                    result = seasonal_decompose(ts_regular, model='additive', period=period)
+                    # 计算季节性强度
+                    seasonal_strength = np.std(result.seasonal) / np.std(ts_regular)
+                    if seasonal_strength > max_strength:
+                        max_strength = seasonal_strength
+                        best_period = period
+                except:
+                    continue
+        
+        seasonality = {
+            "has_seasonality": max_strength > 0.1,  # 季节性强度阈值
+            "seasonal_strength": float(max_strength),
+            "detected_period": best_period,
+        }
+    except:
+        seasonality = {
+            "has_seasonality": False,
+            "seasonal_strength": 0.0,
+            "detected_period": None,
+        }
+    
+    # 趋势分析
+    trend = {}
+    try:
+        x = np.arange(len(values))
+        slope, intercept, r_value, p_value, std_err = stats.linregress(x, values)
+        
+        trend = {
+            "slope": float(slope),
+            "r_squared": float(r_value**2),
+            "p_value": float(p_value),
+            "has_trend": p_value < 0.05 and abs(r_value) > 0.3,
+        }
+    except:
+        trend = {
+            "slope": 0.0,
+            "r_squared": 0.0,
+            "p_value": 1.0,
+            "has_trend": False,
+        }
+    
+    # 异常值检测（简单的Z分数法）
+    outliers = {}
+    try:
+        z_scores = np.abs(stats.zscore(values))
+        outlier_indices = np.where(z_scores > 3)[0]
+        outlier_count = len(outlier_indices)
+        outlier_ratio = outlier_count / len(values) if values else 0
+        
+        outliers = {
+            "outlier_count": int(outlier_count),
+            "outlier_ratio": float(outlier_ratio),
+            "has_outliers": outlier_count > 0,
+        }
+    except:
+        outliers = {
+            "outlier_count": 0,
+            "outlier_ratio": 0.0,
+            "has_outliers": False,
+        }
+    
+    # 波动性分析
+    volatility = {}
+    try:
+        returns = np.diff(values) / values[:-1]
+        returns = returns[~np.isnan(returns) & ~np.isinf(returns)]
+        
+        volatility = {
+            "volatility": float(np.std(returns)),
+            "max_change": float(np.max(np.abs(returns))),
+            "is_volatile": np.std(returns) > 0.05,  # 波动性阈值
+        }
+    except:
+        volatility = {
+            "volatility": 0.0,
+            "max_change": 0.0,
+            "is_volatile": False,
+        }
+    
+    # 汇总特征
+    return {
+        "basic_stats": basic_stats,
+        "stationarity": stationarity,
+        "autocorrelation": autocorrelation,
+        "seasonality": seasonality,
+        "trend": trend,
+        "outliers": outliers,
+        "volatility": volatility,
+    }
+
+def select_detection_methods(features: Dict[str, Any], detector_info: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    if len(ts) < 10:  # 数据点太少
-        return False
-        
-    # 将序列分为前半部分和后半部分
-    mid_point = len(ts) // 2
-    first_half = ts[:mid_point]
-    second_half = ts[mid_point:]
-    
-    # 比较均值
-    mean_diff = abs(first_half.mean() - second_half.mean())
-    mean_threshold = ts.std() * 0.5  # 允许的均值差异阈值
-    
-    # 比较方差
-    var_ratio = first_half.var() / second_half.var() if second_half.var() > 0 else float('inf')
-    var_threshold = 2.0  # 允许的方差比率阈值
-    
-    return mean_diff < mean_threshold and 1/var_threshold < var_ratio < var_threshold
-
-def check_seasonality(ts: pd.Series) -> Tuple[bool, Optional[int]]:
-    """检查时间序列是否具有季节性，并返回可能的季节周期"""
-    if len(ts) < 10:  # 数据点太少
-        return False, None
-        
-    # 计算自相关
-    n = min(len(ts) // 2, 50)  # 最多检查50个lag
-    acf = compute_acf(ts, n)
-    
-    # 查找自相关的峰值
-    peaks = []
-    for i in range(2, len(acf) - 1):
-        if acf[i] > acf[i-1] and acf[i] > acf[i+1] and acf[i] > 0.3:  # 只考虑自相关大于0.3的峰值
-            peaks.append(i)
-    
-    if len(peaks) > 0:
-        # 如果找到多个峰值，返回第一个作为可能的季节周期
-        return True, peaks[0]
-    else:
-        return False, None
-
-def compute_acf(ts: pd.Series, n: int) -> np.ndarray:
-    """计算自相关函数"""
-    result = np.zeros(n+1)
-    y = ts - ts.mean()
-    variance = np.sum(y ** 2) / len(y)
-    
-    for lag in range(n+1):
-        covariance = np.sum(y[:-lag] * y[lag:]) / (len(y) - lag) if lag > 0 else variance
-        result[lag] = covariance / variance
-        
-    return result
-
-def check_trend(ts: pd.Series) -> Tuple[bool, float]:
-    """检查时间序列是否具有趋势，并返回趋势强度"""
-    if len(ts) < 10:  # 数据点太少
-        return False, 0.0
-        
-    # 简单线性回归检测趋势
-    x = np.arange(len(ts))
-    y = ts.values
-    
-    # 计算斜率
-    x_mean = x.mean()
-    y_mean = y.mean()
-    numerator = np.sum((x - x_mean) * (y - y_mean))
-    denominator = np.sum((x - x_mean) ** 2)
-    
-    if denominator == 0:
-        return False, 0.0
-        
-    slope = numerator / denominator
-    
-    # 计算R²
-    y_pred = x_mean + slope * (x - x_mean)
-    ss_total = np.sum((y - y_mean) ** 2)
-    ss_residual = np.sum((y - y_pred) ** 2)
-    r_squared = 1 - (ss_residual / ss_total) if ss_total > 0 else 0
-    
-    # 如果R²较高且斜率不接近0，则认为有趋势
-    has_trend = r_squared > 0.3 and abs(slope) > 0.01 * abs(y.mean())
-    
-    return has_trend, float(r_squared)
-
-def calculate_volatility(ts: pd.Series) -> Tuple[float, str]:
-    """计算时间序列的波动性，并返回描述性结果"""
-    if len(ts) < 5:
-        return 0.0, "数据点不足"
-        
-    # 计算变异系数
-    cv = ts.std() / abs(ts.mean()) if ts.mean() != 0 else float('inf')
-    
-    # 计算平均绝对百分比变化
-    changes = abs(ts.pct_change().dropna())
-    mean_change = changes.mean() if len(changes) > 0 else 0
-    
-    # 计算波动性指数（综合考虑变异系数和平均变化率）
-    volatility_index = 0.7 * min(cv, 1.0) + 0.3 * min(mean_change * 10, 1.0)
-    
-    # 波动性描述
-    if volatility_index < 0.2:
-        volatility_description = "低"
-    elif volatility_index < 0.5:
-        volatility_description = "中"
-    else:
-        volatility_description = "高"
-    
-    return float(volatility_index), volatility_description
-
-def estimate_outlier_ratio(ts: pd.Series) -> float:
-    """估计时间序列中的异常值比例"""
-    if len(ts) < 5:
-        return 0.0
-        
-    # 使用Z-score简单估计
-    z_scores = abs((ts - ts.mean()) / ts.std())
-    outlier_ratio = (z_scores > 3).mean()
-    
-    return float(outlier_ratio)
-
-def calculate_autocorrelation(ts: pd.Series, lag: int) -> float:
-    """计算指定滞后期的自相关系数"""
-    if len(ts) <= lag:
-        return 0.0
-    
-    # 去除均值
-    y = ts - ts.mean()
-    
-    # 计算自相关
-    numerator = np.sum(y[:-lag] * y[lag:])
-    denominator = np.sqrt(np.sum(y[:-lag]**2) * np.sum(y[lag:]**2))
-    
-    if denominator == 0:
-        return 0.0
-    
-    return float(numerator / denominator)
-
-def recommend_detection_methods(features: Dict) -> List[Dict]:
-    """根据时序特征推荐适合的检测方法
-    
-    这个函数根据数据特征，推荐最适合的异常检测方法
-    
-    Returns:
-        包含推荐方法名称和推荐理由的列表
-    """
-    recommended = []
-    
-    # 基本方法，适用于大多数情况
-    recommended.append({
-        "方法": "IQR异常检测",
-        "理由": "适用于大多数场景，对数据分布要求较低，能检测点异常"
-    })
-    
-    # 根据特征推荐方法
-    if features.get("平稳性", False):
-        recommended.append({
-            "方法": "广义ESD检测",
-            "理由": "数据呈现平稳性，适合使用统计检验方法"
-        })
-    
-    if features.get("波动性描述") == "高":
-        recommended.append({
-            "方法": "波动性变化检测",
-            "理由": "数据波动性较高，适合检测波动性的突变"
-        })
-    
-    if features.get("趋势", False):
-        recommended.append({
-            "方法": "水平位移检测",
-            "理由": "数据存在明显趋势，适合检测水平位移异常"
-        })
-    
-    if features.get("季节性", False):
-        recommended.append({
-            "方法": "季节性异常检测",
-            "理由": "数据具有季节性模式，适合检测偏离季节模式的异常"
-        })
-    
-    # 如果数据点较多，添加一些更复杂的方法
-    if features.get("长度", 0) > 30:
-        recommended.append({
-            "方法": "持续性异常检测",
-            "理由": "数据点数量充足，适合检测与前序值的异常偏差"
-        })
-        
-        if features.get("自相关系数(lag=1)", 0) > 0.5:
-            recommended.append({
-                "方法": "自回归异常检测",
-                "理由": "数据具有较强的自相关性，适合使用自回归模型"
-            })
-    
-    # 如果检测到明显的异常比例
-    if features.get("异常值比例估计", 0) > 0.01:
-        recommended.append({
-            "方法": "分位数异常检测",
-            "理由": "数据中可能存在异常值，适合使用分位数方法"
-        })
-    
-    # 返回不超过5个的推荐方法
-    return recommended[:5]
-
-# 直接使用的异常检测方法选择函数
-def select_detection_methods(features: Dict, detector_info: Dict) -> List[Dict]:
-    """根据时序特征和检测器信息，选择最适合的异常检测方法
+    根据时序特征和检测方法信息，选择最适合的检测方法
     
     Args:
-        features: 时序数据特征
-        detector_info: 检测器信息
+        features: 时序特征
+        detector_info: 检测方法信息
         
     Returns:
-        选定的异常检测方法列表，包含方法名称、参数和权重
+        选定的检测方法列表，每个方法包含名称、参数和权重
     """
     selected_methods = []
     
-    # 获取单变量检测器信息
-    single_var_detectors = detector_info.get("单变量检测器", [])
-    
-    # 根据特征提取重要信息
-    data_length = features.get("长度", 0)
-    is_stationary = features.get("平稳性", False)
-    has_seasonality = features.get("季节性", False)
-    seasonality_period = features.get("季节周期")
-    has_trend = features.get("趋势", False)
-    volatility = features.get("波动性描述", "中")
-    auto_corr = features.get("自相关系数(lag=1)", 0)
-    outlier_ratio = features.get("异常值比例估计", 0)
-    
-    # 定义权重和选择条件
-    detector_scores = {}
-    
-    # 对每个检测器评分
-    for detector in single_var_detectors:
-        score = 0.0
-        method_name = detector.get("类名", "")
+    # 获取各特征指标
+    try:
+        has_outliers = features.get("outliers", {}).get("has_outliers", False)
+        has_trend = features.get("trend", {}).get("has_trend", False)
+        has_seasonality = features.get("seasonality", {}).get("has_seasonality", False)
+        is_stationary = features.get("stationarity", {}).get("is_stationary", False)
+        has_autocorrelation = features.get("autocorrelation", {}).get("has_autocorrelation", False)
+        is_volatile = features.get("volatility", {}).get("is_volatile", False)
         
-        # 根据特征对每个方法进行评分
-        if method_name == "InterQuartileRangeAD":
-            # IQR方法适用于大多数情况
-            score = 0.7
-            
-        elif method_name == "GeneralizedESDTestAD":
-            # 广义ESD方法适用于平稳数据
-            score = 0.5
-            if is_stationary:
-                score += 0.3
-            
-        elif method_name == "QuantileAD":
-            # 分位数方法适用于有明显异常的数据
-            score = 0.4
-            if outlier_ratio > 0.01:
-                score += 0.3
-            
-        elif method_name == "ThresholdAD":
-            # 阈值方法适用于有明确阈值的数据
-            score = 0.3  # 默认较低分数，因为需要人工设置阈值
-            
-        elif method_name == "PersistAD":
-            # 持续性方法适用于有自相关性的数据
-            score = 0.4
-            if auto_corr > 0.3:
-                score += 0.3
-                
-        elif method_name == "LevelShiftAD":
-            # 水平位移方法适用于有趋势的数据
-            score = 0.4
-            if has_trend:
-                score += 0.3
-                
-        elif method_name == "VolatilityShiftAD":
-            # 波动性变化方法适用于高波动性数据
-            score = 0.3
-            if volatility == "高":
-                score += 0.4
-                
-        elif method_name == "SeasonalAD":
-            # 季节性方法适用于有季节性的数据
-            score = 0.3
-            if has_seasonality:
-                score += 0.5
-                
-        elif method_name == "AutoregressionAD":
-            # 自回归方法适用于强自相关数据
-            score = 0.3
-            if auto_corr > 0.5:
-                score += 0.4
+        # 为每种可能的异常模式选择合适的方法
         
-        # 数据长度不足时减分
-        if data_length < 30 and method_name in ["SeasonalAD", "AutoregressionAD", "VolatilityShiftAD"]:
-            score -= 0.3
+        # 1. 处理离群值检测
+        if has_outliers:
+            # IQR检测非常适合离群值检测
+            if "IQR异常检测" in detector_info:
+                selected_methods.append({
+                    "method": "IQR异常检测",
+                    "parameters": {"c": 2.5},  # 稍微降低阈值使其更敏感
+                    "weight": 0.8,
+                    "reason": "数据含有明显离群点，IQR方法适合检测孤立的异常值"
+                })
+            
+            # 分位数异常检测也适合
+            if "分位数异常检测" in detector_info:
+                selected_methods.append({
+                    "method": "分位数异常检测",
+                    "parameters": {"low": 0.05, "high": 0.95},
+                    "weight": 0.7,
+                    "reason": "数据分布有长尾特征，分位数方法可以有效处理"
+                })
         
-        # 记录评分
-        detector_scores[method_name] = score
-    
-    # 选择评分最高的3-5个方法
-    sorted_detectors = sorted(detector_scores.items(), key=lambda x: x[1], reverse=True)
-    top_detectors = sorted_detectors[:min(5, len(sorted_detectors))]
-    
-    # 确保至少有3个方法（如果可能）
-    if len(top_detectors) < 3 and len(sorted_detectors) >= 3:
-        top_detectors = sorted_detectors[:3]
-    
-    # 构建方法参数
-    for method_name, score in top_detectors:
-        # 跳过评分太低的方法
-        if score < 0.3:
-            continue
+        # 2. 处理趋势变化
+        if has_trend:
+            # 自回归适合趋势变化
+            if "自回归异常检测" in detector_info:
+                selected_methods.append({
+                    "method": "自回归异常检测",
+                    "parameters": {"c": 3.0, "n_steps": 1},
+                    "weight": 0.7,
+                    "reason": "数据存在趋势，自回归方法可以检测趋势中的异常"
+                })
             
-        # 设置方法的默认参数
-        params = {}
+            # 水平位移检测适合趋势突变
+            if "水平位移检测" in detector_info:
+                selected_methods.append({
+                    "method": "水平位移检测",
+                    "parameters": {"window": 5, "c": 6.0},
+                    "weight": 0.6,
+                    "reason": "检测数据中可能存在的水平位移异常"
+                })
         
-        # 根据特征设置适当的参数
-        if method_name == "InterQuartileRangeAD":
-            c = 3.0
-            if outlier_ratio > 0.05:
-                c = 4.0  # 异常值比例高时，提高阈值减少误报
-            params = {"c": c}
-            
-        elif method_name == "GeneralizedESDTestAD":
-            params = {"alpha": 0.05}
-            
-        elif method_name == "QuantileAD":
-            params = {"low": 0.05, "high": 0.95}
-            
-        elif method_name == "ThresholdAD":
-            # 使用中位数和IQR估计合适的阈值
-            median = features.get("中位数", 0)
-            iqr = features.get("四分位距", 1)
-            params = {
-                "low": median - 3 * iqr if iqr > 0 else None,
-                "high": median + 3 * iqr if iqr > 0 else None
-            }
-            
-        elif method_name == "PersistAD":
-            window = 5 if data_length > 50 else 3
-            params = {"window": window, "c": 3.0, "side": "both"}
-            
-        elif method_name == "LevelShiftAD":
-            window = 10 if data_length > 100 else 5
-            params = {"window": window, "c": 6.0, "side": "both"}
-            
-        elif method_name == "VolatilityShiftAD":
-            window = 15 if data_length > 150 else 10
-            params = {"window": window, "c": 6.0, "side": "both", "agg": "std"}
-            
-        elif method_name == "SeasonalAD":
-            freq = seasonality_period if seasonality_period else None
-            params = {"freq": freq, "c": 3.0, "trend": has_trend}
-            
-        elif method_name == "AutoregressionAD":
-            n_steps = 3 if auto_corr > 0.7 else 1
-            params = {"n_steps": n_steps, "c": 3.0, "side": "both"}
+        # 3. 处理季节性异常
+        if has_seasonality:
+            if "季节性异常检测" in detector_info:
+                # 设置合适的周期
+                period = features.get("seasonality", {}).get("detected_period")
+                if period:
+                    selected_methods.append({
+                        "method": "季节性异常检测",
+                        "parameters": {"freq": int(period), "c": 3.0},
+                        "weight": 0.8,
+                        "reason": f"数据有明显周期({period})，季节性检测可识别周期中的异常模式"
+                    })
         
-        # 添加权重
-        params["weight"] = score
+        # 4. 处理波动性变化
+        if is_volatile:
+            if "波动性变化检测" in detector_info:
+                selected_methods.append({
+                    "method": "波动性变化检测",
+                    "parameters": {"window": 10, "c": 5.0},
+                    "weight": 0.7,
+                    "reason": "数据波动性较大，适合检测波动性突变"
+                })
         
-        # 添加到选定方法列表
-        for detector in single_var_detectors:
-            if detector.get("类名") == method_name:
-                method_display_name = next((name for name, m in {
-                    "IQR异常检测": "InterQuartileRangeAD",
-                    "广义ESD检测": "GeneralizedESDTestAD",
-                    "分位数异常检测": "QuantileAD",
-                    "阈值异常检测": "ThresholdAD",
-                    "持续性异常检测": "PersistAD",
-                    "水平位移检测": "LevelShiftAD",
-                    "波动性变化检测": "VolatilityShiftAD",
-                    "季节性异常检测": "SeasonalAD",
-                    "自回归异常检测": "AutoregressionAD"
-                }.items() if m == method_name), method_name)
+        # 5. 通用方法（无论特征如何，这些方法通常都有效）
+        
+        # 持续性异常检测
+        if "持续性异常检测" in detector_info:
+            window_size = 3  # 默认窗口大小
+            if has_autocorrelation:
+                window_size = 5  # 自相关数据使用更大窗口
+            
+            selected_methods.append({
+                "method": "持续性异常检测",
+                "parameters": {"window": window_size, "c": 3.0},
+                "weight": 0.6,
+                "reason": "检测持续的异常情况"
+            })
+        
+        # 如果方法数量不足，添加一些通用方法
+        if len(selected_methods) < 3:
+            if "广义ESD检测" in detector_info and "广义ESD检测" not in [m["method"] for m in selected_methods]:
+                selected_methods.append({
+                    "method": "广义ESD检测",
+                    "parameters": {"alpha": 0.05},
+                    "weight": 0.5,
+                    "reason": "通用的异常检测方法，适用于多种场景"
+                })
+            
+            if "阈值异常检测" in detector_info and "阈值异常检测" not in [m["method"] for m in selected_methods]:
+                # 根据数据特征设置合理的阈值
+                basic_stats = features.get("basic_stats", {})
+                mean = basic_stats.get("mean", 0)
+                std = basic_stats.get("std", 1)
                 
                 selected_methods.append({
-                    "方法名称": method_display_name,
-                    "类名": method_name,
-                    "参数": params,
-                    "理由": detector.get("适用场景", ""),
-                    "评分": score
+                    "method": "阈值异常检测",
+                    "parameters": {"low": mean - 2.5*std, "high": mean + 2.5*std},
+                    "weight": 0.4,
+                    "reason": "基于统计特征设置的自适应阈值检测"
                 })
-                break
     
-    return selected_methods
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"选择检测方法时发生错误: {e}")
+        
+        # 出错时返回一些基本方法
+        if "IQR异常检测" in detector_info:
+            selected_methods.append({
+                "method": "IQR异常检测",
+                "parameters": {"c": 3.0},
+                "weight": 0.7,
+                "reason": "基础异常检测方法"
+            })
+        
+        if "持续性异常检测" in detector_info:
+            selected_methods.append({
+                "method": "持续性异常检测",
+                "parameters": {"window": 3, "c": 3.0},
+                "weight": 0.6,
+                "reason": "检测持续的异常情况"
+            })
+    
+    # 最多返回5个方法
+    return selected_methods[:5]
