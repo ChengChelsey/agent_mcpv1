@@ -314,6 +314,43 @@ def build_method_catalog(detector_info):
     
     return json.dumps(catalog, ensure_ascii=False, indent=2)[:4000]  # 避免超出token长度限制
 
+def select_default_methods(detector_info, max_methods=5):
+    """当LLM选择失败时提供默认方法"""
+    default_methods = []
+    
+    # 优先选择的方法
+    priority_methods = [
+        "IQR异常检测",
+        "分位数异常检测",
+        "水平位移检测",
+        "季节性异常检测",
+        "自回归异常检测"
+    ]
+    
+    # 从优先方法中选择可用的
+    available_methods = list(detector_info.keys())
+    for method in priority_methods:
+        if method in available_methods and len(default_methods) < max_methods:
+            default_methods.append({
+                "method": method,
+                "params": {},
+                "weight": 1.0 / min(max_methods, len(priority_methods)),
+                "reason": "默认推荐方法"
+            })
+    
+    # 如果优先方法不足，从其他可用方法中补充
+    if len(default_methods) < max_methods:
+        remaining = [m for m in available_methods if m not in priority_methods]
+        for method in remaining[:max_methods-len(default_methods)]:
+            default_methods.append({
+                "method": method,
+                "params": {},
+                "weight": 1.0 / min(max_methods, len(priority_methods) + len(remaining)),
+                "reason": "补充推荐方法"
+            })
+    
+    return default_methods
+
 def llm_select_methods(features, detector_info, max_methods=5):
     """
     让大模型根据时序特征选择合适的检测方法
