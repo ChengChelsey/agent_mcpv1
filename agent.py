@@ -28,6 +28,7 @@ from utils.mcp_detector import detect_with_mcp
 from mcp_client import get_mcp_client
 from output.report_generator import generate_llm_report, generate_report_html
 from output.visualization import generate_summary_echarts_html
+import subprocess
 
 import logging
 logger = logging.getLogger(__name__)
@@ -295,26 +296,29 @@ tools = [
 # 新增工具函数
 ###############################################################################
 
-def build_method_catalog(detector_info: Dict[str, Any]) -> str:
-    """把 DETECTOR_META 转成简短 JSON 字符串送给 LLM，主要包括方法名、描述和默认参数"""
-    cats = []
-    for name, meta in detector_info.items():
-        cats.append({
+def build_method_catalog(detector_info):
+    """
+    将检测器信息格式化为大模型易于理解的格式
+    """
+    catalog = []
+    for name, info in detector_info.items():
+        method_info = {
             "name": name,
-            "default_params": meta.get("default_params", {}),
-            "description": meta.get("description", ""),
-            "category": meta.get("category", ""),
-            "suitable_features": meta.get("suitable_features", []),
-            "limitations": meta.get("limitations", [])
-        })
-    return json.dumps(cats, ensure_ascii=False, indent=2)[:4000]   # 控制长度
+            "description": info.get("description", ""),
+            "principle": info.get("principle", ""),
+            "suitable_features": info.get("suitable_features", []),
+            "limitations": info.get("limitations", []),
+            "default_params": info.get("default_params", {})
+        }
+        catalog.append(method_info)
+    
+    return json.dumps(catalog, ensure_ascii=False, indent=2)[:4000]  # 避免超出token长度限制
 
-def llm_select_methods(features: Dict[str, Any],
-                       detector_info: Dict[str, Any],
-                       max_methods: int = 5) -> list[dict]:
-    """通过 prompt 让 LLM 选择并返回 [{method, params}]"""
-
-    sys_msg = (
+def llm_select_methods(features, detector_info, max_methods=5):
+    """
+    让大模型根据时序特征选择合适的检测方法
+    """
+    system_prompt = (
         "你是时序异常检测专家。"
         "我将提供：1) 序列特征 JSON；2) 可用检测方法列表(JSON)。\n"
         "请你基于特征选择 **最多 "
@@ -322,41 +326,93 @@ def llm_select_methods(features: Dict[str, Any],
         "并返回 JSON: {\"selected\":[{\"method\":\"...\",\"params\":{...},\"weight\":数值,\"reason\":\"选择理由\"}]}。\n"
         "理由需要解释为什么该方法适合这个时序数据的特征。\n"
         "权重是0-1之间的值，表示该方法对最终结果的影响程度，所有权重之和应为1。\n"
-        "如果默认参数即可，请留空 params。"
+        "如果默认参数即可，请留空 params。\n"
+        "注意：你只能从提供的可用方法列表中选择方法，不要创造新的方法名。"
     )
 
+    # 提取方法名列表，明确告诉模型可用的方法
+    available_methods = []
+    for name, info in detector_info.items():
+        method_info = {
+            "name": name,
+            "description": info.get("description", ""),
+            "suitable_features": info.get("suitable_features", []),
+            "default_params": info.get("default_params", {})
+        }
+        available_methods.append(method_info)
+    
+    # 告诉模型具体可用的方法名
+    method_names = [m["name"] for m in available_methods]
+    
     user_msg = (
         "序列特征:\n" + json.dumps(features, ensure_ascii=False, indent=2) +
-        "\n可用方法列表:\n" + build_method_catalog(detector_info)
+        "\n\n可用方法列表:\n" + json.dumps(available_methods, ensure_ascii=False, indent=2) +
+        "\n\n仅可用的方法名称:\n" + json.dumps(method_names, ensure_ascii=False)
     )
 
-    msg = [{"role": "system", "content": sys_msg},
-           {"role": "user", "content": user_msg}]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg}
+    ]
 
-    rsp = llm_call(msg)
-    if not rsp:
-        return []
+    response = llm_call(messages)
+    if not response:
+        logger.warning("LLM未返回结果，使用默认方法")
+        return select_default_methods(detector_info, max_methods)
 
     try:
-        parsed = json.loads(rsp["content"])
-        return parsed.get("selected", [])
-    except Exception:
-        logger.error("LLM返回的方法选择结果解析失败")
-        return []
+        content = response.get("content", "")
+        # 尝试找到JSON部分
+        json_start = content.find("{")
+        json_end = content.rfind("}")
+        
+        if json_start >= 0 and json_end > json_start:
+            json_str = content[json_start:json_end+1]
+            parsed = json.loads(json_str)
+            selected = parsed.get("selected", [])
+            
+            # 验证选择的方法是否在可用列表中
+            valid_selected = []
+            for method_info in selected:
+                method_name = method_info.get("method")
+                if method_name in method_names:
+                    valid_selected.append(method_info)
+                else:
+                    logger.warning(f"LLM选择了不可用的方法: {method_name}")
+            
+            if valid_selected:
+                # 确保权重合计为1
+                total_weight = sum(m.get("weight", 0) for m in valid_selected)
+                if total_weight > 0:
+                    for m in valid_selected:
+                        m["weight"] = round(m.get("weight", 0) / total_weight, 2)
+                return valid_selected
+                
+        logger.warning("LLM返回格式无效或没有选择有效方法，使用默认方法")
+        return select_default_methods(detector_info, max_methods)
+    except Exception as e:
+        logger.error(f"LLM返回的方法选择结果解析失败: {e}")
+        return select_default_methods(detector_info, max_methods)
     
 async def get_detection_methods():
-    """从MCP服务器获取异常检测方法信息"""
+    """从MCP服务器获取异常检测方法信息并添加适用场景描述"""
     try:
         client = await get_mcp_client()
         detector_info = await client.list_detectors()
         
-        # 为每个检测器添加适用特征和局限性描述（如果原始数据中没有）
+        # 增强检测器信息
         for name, info in detector_info.items():
-            if "suitable_features" not in info:
-                info["suitable_features"] = get_detector_suitable_features(name)
-            if "limitations" not in info:
-                info["limitations"] = get_detector_limitations(name)
-                
+            # 如果存在描述信息，将其添加到每个方法
+            from detector_descriptions import DETECTOR_DESCRIPTIONS
+            if name in DETECTOR_DESCRIPTIONS:
+                local_desc = DETECTOR_DESCRIPTIONS[name]
+                info.update({
+                    "principle": local_desc.get("principle", ""),
+                    "suitable_features": local_desc.get("suitable_features", []),
+                    "limitations": local_desc.get("limitations", []),
+                    "parameters": local_desc.get("parameters", {})
+                })
+        
         return detector_info
     except Exception as e:
         logger.error(f"获取检测方法信息错误: {e}")
@@ -484,26 +540,19 @@ def get_detector_limitations(name):
     }
     
     return limitations.get(name, ["需要适当调整参数以适应具体数据"])
-
 async def execute_detection(method, series_data, params=None):
-    """执行异常检测
-    
-    Args:
-        method: 检测方法名称，如 "IQR异常检测"
-        series_data: 时间序列数据
-        params: 检测参数，如果为None则使用默认参数
-    
-    Returns:
-        检测结果
-    """
+    """执行异常检测"""
     try:
-        # 获取MCP客户端
+        # 指定参数为空字典而非None
+        params = params or {}
+        
+        # 简化日志
+        logger.info(f"执行检测方法: {method}, 参数: {json.dumps(params)[:100]}")
+        
         client = await get_mcp_client()
+        result = await client.detect(method, series_data, params)
         
-        # 执行检测
-        result = await client.detect(method, series_data, params or {})
-        
-        # 检查是否有错误
+        # 检查结果
         if isinstance(result, dict) and "error" in result:
             logger.error(f"检测错误: {result['error']}")
             return {"error": result["error"], "method": method}
@@ -513,7 +562,7 @@ async def execute_detection(method, series_data, params=None):
         logger.error(f"执行异常检测错误: {e}")
         traceback.print_exc()
         return {"error": f"执行异常检测失败: {str(e)}", "method": method}
-
+    
 async def cleanup_mcp_resources():
     """清理MCP资源"""
     try:
@@ -527,7 +576,7 @@ def calculate_composite_score(detection_results):
     """计算综合异常评分"""
     try:
         if not detection_results or len(detection_results) == 0:
-            return {"score": 0.0, "classification": "正常"}
+            return {"score": 0.0, "classification": "正常", "anomalies": [], "anomaly_count": 0}
         
         total_weight = 0.0
         weighted_score = 0.0
@@ -573,7 +622,7 @@ def calculate_composite_score(detection_results):
     except Exception as e:
         logger.error(f"计算综合评分错误: {e}")
         traceback.print_exc()
-        return {"error": f"计算综合评分失败: {str(e)}"}
+        return {"score": 0.0, "classification": "正常", "anomalies": [], "anomaly_count": 0, "error": str(e)}
 
 async def generate_detection_report(series_data, detection_results, composite_score, classification, metadata, is_multi_series=False, series2=None):
     """生成异常检测报告"""
@@ -602,17 +651,27 @@ async def generate_detection_report(series_data, detection_results, composite_sc
         
         # 生成LLM分析
         user_query = metadata.get("user_query", "")
+        
+        # 处理composite_score为字典或浮点数的情况
+        anomalies = []
+        if isinstance(composite_score, dict):
+            anomalies = composite_score.get("anomalies", [])
+            score_value = composite_score.get("score", 0.0)
+        else:
+            # 如果是浮点数，创建一个新的字典
+            score_value = composite_score
+            
         result_dict = {
             "classification": classification,
-            "composite_score": composite_score,
-            "anomaly_times": composite_score.get("anomalies", []),
+            "composite_score": score_value,
+            "anomaly_times": anomalies,
             "method_results": detection_results,
             "user_query": user_query
         }
         
         # 多序列时添加异常区间
         if is_multi_series:
-            anomaly_intervals = group_anomaly_times(composite_score.get("anomalies", []))
+            anomaly_intervals = group_anomaly_times(anomalies)
             result_dict["anomaly_intervals"] = anomaly_intervals
             
         llm_analysis = generate_llm_report(result_dict, "multi" if is_multi_series else "single")
@@ -621,7 +680,7 @@ async def generate_detection_report(series_data, detection_results, composite_sc
         final_report_path = os.path.join(base_dir, "final_report.html")
         generate_report_html(
             user_query, chart_path, detection_results, tooltip_map, final_report_path, 
-            composite_score=composite_score["score"],
+            composite_score=score_value,
             classification=classification,
             llm_analysis=llm_analysis,
             is_multi_series=is_multi_series
@@ -637,7 +696,54 @@ async def generate_detection_report(series_data, detection_results, composite_sc
         traceback.print_exc()
         return {"error": f"生成报告失败: {str(e)}"}
 
+def run_mcp_operation(operation: str, params: dict | None = None):
+    """通过 mcp_process.py 子进程执行 MCP 操作，完全隔离事件循环"""
+    params = params or {}
+    input_json = json.dumps({"operation": operation, "params": params})
 
+    proc = subprocess.Popen(
+        ["python", "mcp_process.py"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    stdout, stderr = proc.communicate(input_json)
+
+    if proc.returncode != 0:
+        logger.error(f"MCP 子进程异常退出：{stderr.strip()}")
+        return {"error": stderr.strip() or "子进程执行失败"}
+
+    try:
+        result = json.loads(stdout)
+    except json.JSONDecodeError:
+        logger.error(f"无法解析子进程输出：{stdout[:200]}...")
+        return {"error": f"无法解析子进程输出：{stdout[:200]}..."}
+
+    if result.get("status") != "success":
+        return {"error": result.get("message", "未知错误")}
+
+    # 确保返回的结果是有效的JSON
+    inner = result["result"]
+    try:
+        if isinstance(inner, str) and inner.strip():
+            return json.loads(inner)
+        return inner
+    except json.JSONDecodeError:
+        logger.error(f"无法解析内部结果JSON：{inner[:200]}...")
+        return {"error": f"无法解析内部结果：{inner[:200]}..."}
+
+def get_all_detectors() -> dict:
+    """列出所有检测方法（同步、隔离）"""
+    return run_mcp_operation("list_detectors")
+
+def execute_detection(method: str, series: list, params: dict | None = None) -> dict:
+    """执行单个检测（同步、隔离）"""
+    return run_mcp_operation("detect", {
+        "method": method,
+        "series": series,
+        "params": params or {}
+    })
 ###############################################################################
 # 工具函数
 ###############################################################################
@@ -733,192 +839,176 @@ def parse_llm_response(txt):
         "supplement": ext(pat_supplement)
     }
 
+def get_detection_methods_sync() -> Dict[str, Any]:
+    """同步获取检测器信息（内部使用 asyncio.run）"""
+    async def _inner():
+        try:
+            client = await get_mcp_client()
+            detector_info = await client.list_detectors()
+            return detector_info
+        except Exception as e:
+            logger.error(f"获取检测方法信息错误: {e}")
+            traceback.print_exc()
+            return {"error": str(e)}
+    return asyncio.run(_inner())
+
 ###############################################################################
 # 主要ReAct流程
 ###############################################################################
-
-def react(llm_text: str, session_state: dict) -> tuple[Any, bool]:
-    """处理LLM的回复，执行工具调用，返回结果和是否完成标志"""
+def react(llm_text: str, session_state: dict) -> Tuple[Any, bool]:
+    """
+    解析 LLM XML-style 回复并执行相应工具。
+    返回 (result, done)；done=True 表示 <最终答案> 已给出。
+    """
     parsed = parse_llm_response(llm_text)
-    action = parsed["action"]
-    inp_str = parsed["action_input"]
-    final_ans = parsed["final_answer"]
-    supplement = parsed["supplement"]
-    is_final = False
+    action      = parsed["action"].strip()
+    inp_str     = parsed["action_input"].strip()
+    final_ans   = parsed["final_answer"].strip()
+    supplement  = parsed["supplement"].strip()
 
-    if action and inp_str:
-        try:
-            action_input = json.loads(inp_str)
-        except:
-            return f"无法解析调用参数JSON: {inp_str}", False
-
-        # 处理同步工具调用
-        if action == "解析用户自然语言时间":
-            return parse_time_expressions(action_input["raw_text"]), False
-            
-        if action == "请求智能运管后端Api，获取指标项的时序数据":
-            data = get_series_data(**action_input)
-            session_state["series"] = data  # 缓存时序数据
-            return data, False
-            
-        if action == "请求智能运管后端Api，查询监控实例有哪些监控项":
-            return monitor_item_list(action_input["instance"]), False
-            
-        elif action == "请求智能运管后端Api，查询监控服务的资产情况和监控实例":
-            return get_service_asset(action_input["service"]), False
-            
-        elif action == "请求智能运管后端Api，查询监控实例之间的拓扑关联关系":
-            return get_service_asset_edges(action_input["service"], action_input["instance_ip"]), False
-            
-        # 处理异步工具调用
-        elif action == "分析时序数据特征":
-    # 提取时序特征，返回特征和检测方法建议
-            try:
-                series = action_input["series"]
-                features = extract_time_series_features(series)
-        
-        # 创建一个新的事件循环来执行异步操作
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-            # 获取检测方法信息（异步调用）
-                    detector_info = loop.run_until_complete(get_detection_methods())
-                finally:
-            # 确保关闭事件循环
-                    loop.close()
-        
-        # 让LLM选择合适的检测方法
-                selected = llm_select_methods(features, detector_info)
-        
-        # 保存到会话状态
-                session_state["series"] = series
-                session_state["selected_methods"] = selected
-                session_state["features"] = features
-        
-                return {"features": features, "selected_methods": selected}, False
-            except Exception as e:
-                logger.error(f"分析时序数据特征错误: {e}")
-                traceback.print_exc()
-                return {"error": f"分析时序数据特征失败: {str(e)}"}, False
-            
-        elif action == "获取异常检测方法信息":
-            try:
-        # 创建一个新的事件循环来执行异步操作
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    result = loop.run_until_complete(get_detection_methods())
-                finally:
-            # 确保关闭事件循环
-                    loop.close()
-                return result, False
-            except Exception as e:
-                logger.error(f"获取异常检测方法信息错误: {e}")
-                return {"error": f"获取异常检测方法信息失败: {str(e)}"}, False
-            
-        elif action == "执行异常检测":
-            try:
-                method = action_input["method"]
-                series = action_input["series"]
-                params = action_input.get("params", {})
-        
-        # 保存当前数据到会话状态，以便后续使用
-                if "current_detection_results" not in session_state:
-                    session_state["current_detection_results"] = []
-            
-        # 创建一个新的事件循环来执行异步操作
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-            # 执行检测（异步调用）
-                    result = loop.run_until_complete(execute_detection(method, series, params))
-                finally:
-            # 确保关闭事件循环
-                    loop.close()
-        
-        # 如果执行成功，保存结果
-                if "error" not in result:
-            # 添加方法权重
-                    if "selected_methods" in session_state:
-                        for selected in session_state["selected_methods"]:
-                            if selected["method"] == method:
-                                weight = selected.get("weight", 0.5)
-                                if "parameters" not in result:
-                                    result["parameters"] = {}
-                                result["parameters"]["weight"] = weight
-                                break
-                        
-                    session_state["current_detection_results"].append(result)
-        
-                return result, False
-            except Exception as e:
-                logger.error(f"执行异常检测错误: {e}")
-                traceback.print_exc()
-                return {"error": f"执行异常检测失败: {str(e)}"}, False
-
-            
-        elif action == "计算综合异常评分":
-            try:
-                detection_results = action_input["detection_results"]
-                result = calculate_composite_score(detection_results)
-                
-                # 保存计算结果到会话状态
-                session_state["composite_score"] = result
-                
-                return result, False
-            except Exception as e:
-                logger.error(f"计算综合异常评分错误: {e}")
-                traceback.print_exc()
-                return {"error": f"计算综合异常评分失败: {str(e)}"}, False
-            
-        elif action == "生成异常检测报告":
-            try:
-                series = action_input["series"]
-                detection_results = action_input["detection_results"]
-                composite_score = action_input["composite_score"]
-                classification = action_input["classification"]
-                metadata = action_input["metadata"]
-                is_multi_series = action_input.get("is_multi_series", False)
-                series2 = action_input.get("series2", None)
-        
-        # 创建一个新的事件循环来执行异步操作
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-            # 生成报告（异步调用）
-                    result = loop.run_until_complete(generate_detection_report(
-                        series,
-                        detection_results,
-                        composite_score,
-                        classification,
-                        metadata,
-                        is_multi_series,
-                        series2
-                    ))
-            
-            # 清理资源
-                    loop.run_until_complete(cleanup_mcp_resources())
-                finally:
-            # 确保关闭事件循环
-                    loop.close()
-        
-                return result, False
-            except Exception as e:
-                logger.error(f"生成异常检测报告错误: {e}")
-                traceback.print_exc()
-                return {"error": f"生成异常检测报告失败: {str(e)}"}, False
-        
-        else:
-            return f"未知工具调用: {action}", False
-        
-    if supplement.strip():
+    # ---------- 补充信息 ----------
+    if supplement:
         return {"type": "supplement", "content": supplement}, False
 
-    if final_ans.strip():
-        is_final = True
-        return final_ans, is_final
+    # ---------- 最终答案 ----------
+    if final_ans and not action:      # 有答案且无工具调用
+        return final_ans, True
+
+    # ---------- 工具调用 ----------
+    if not action:                    # 没指定工具
+        return "缺少 <工具调用> 标签或工具名为空", False
+
+    try:
+        params: Dict[str, Any] = json.loads(inp_str or "{}")
+    except Exception:
+        return f"无法解析 <调用参数> JSON：{inp_str}", False
+
+    # 1. 解析自然语言时间 -----------------------------------------
+    if action == "解析用户自然语言时间":
+        return parse_time_expressions(params["raw_text"]), False
+
+    # 2. 获取时序数据 ---------------------------------------------
+    if action == "请求智能运管后端Api，获取指标项的时序数据":
+        data = get_series_data(**params)
+        session_state["series"] = data
+        return data, False
+
+    # 3. 时序特征提取 + 选择方法 ------------------------------------
+    if action == "分析时序数据特征":
+        series = params["series"]
+        features = extract_time_series_features(series)
+
+        detector_info = get_all_detectors()       # 同步拿到
+        selected = llm_select_methods(features, detector_info)
+
+        # 缓存
+        session_state.update({
+            "series": series,
+            "features": features,
+            "selected_methods": selected
+        })
+        return {"features": features, "selected_methods": selected}, False
+
+    # 4. 执行单个 MCP 检测 ----------------------------------------
+    if action == "执行异常检测":
+        method  = params["method"]
+        series  = params["series"]
+        p       = params.get("params", {})
+        result  = execute_detection(method, series, p)
+        return result, False
+
+    # 5. **批量** 执行选定方法 -------------------------------------
+    if action == "批量执行选定检测方法":
+            if not session_state.get("series") or not session_state.get("selected_methods"):
+                return "缺少序列数据或方法列表，无法执行批量检测", False
+
+            try:
+                det_results = []
+                available_methods = get_all_detectors()
+                available_method_names = list(available_methods.keys()) if isinstance(available_methods, dict) and "error" not in available_methods else []
         
-    return ("格式不符合要求，必须使用：<思考过程></思考过程> <工具调用></工具调用> <调用参数></调用参数> <最终答案></最终答案>", is_final)
+                success_count = 0
+                for item in session_state["selected_methods"]:
+                    method = item["method"]
+            
+            # 检查方法是否可用
+                    if method not in available_method_names:
+                        logger.warning(f"跳过不可用的方法: {method}")
+                        continue
+            
+                    params = item.get("params", {})
+                    weight = item.get("weight", 0.5)
+            
+            # 执行检测
+                    result = execute_detection(method, session_state["series"], params)
+            
+            # 检查结果是否有错误
+                    if "error" in result:
+                        logger.warning(f"方法 {method} 执行出错: {result['error']}")
+                        continue
+                
+            # 添加权重到结果
+                    if "parameters" not in result:
+                        result["parameters"] = {}
+                    result["parameters"]["weight"] = weight
+            
+                    det_results.append(result)
+                    success_count += 1
+        
+                if not det_results:
+                    return {"error": "所有选定的检测方法都执行失败"}, False
+            
+                logger.info(f"成功执行 {success_count}/{len(session_state['selected_methods'])} 个检测方法")
+        
+        # 计算综合得分
+                comp = calculate_composite_score(det_results)
+                session_state["current_detection_results"] = det_results
+                session_state["composite_score"] = comp
+                return {"detection_results": det_results, "composite_score": comp}, False
+            except Exception as e:
+                logger.error(f"批量执行检测方法出错: {e}")
+                return {"error": f"批量执行检测方法失败: {str(e)}"}, False
+    # 6. 计算综合分数 ---------------------------------------------
+    if action == "计算综合异常评分":
+        comp = calculate_composite_score(params["detection_results"])
+        session_state["composite_score"] = comp
+        return comp, False
+
+    # 7. 生成报告 --------------------------------------------------
+    if action == "生成异常检测报告":
+        comp_score = params["composite_score"]
+        if not isinstance(comp_score, dict):
+            comp_score = {
+                "score": comp_score,
+                "classification": params["classification"],
+                "anomalies": [],
+                "anomaly_count": 0
+            }
+    
+        result = asyncio.run(generate_detection_report(
+            params["series"],
+            params["detection_results"],
+            comp_score,  # 使用处理后的comp_score
+            params["classification"],
+            params["metadata"],
+            params.get("is_multi_series", False),
+            params.get("series2")
+        ))
+        asyncio.run(cleanup_mcp_resources())
+        return result, False
+
+    # 8. 其它简单查询 ---------------------------------------------
+    if action == "请求智能运管后端Api，查询监控实例有哪些监控项":
+        return monitor_item_list(params["instance"]), False
+
+    if action == "请求智能运管后端Api，查询监控服务的资产情况和监控实例":
+        return get_service_asset(params["service"]), False
+
+    if action == "请求智能运管后端Api，查询监控实例之间的拓扑关联关系":
+        return get_service_asset_edges(params["service"], params["instance_ip"]), False
+
+    # 未识别工具 ---------------------------------------------------
+    return f"未知工具调用: {action}", False
 
 def _to_builtin(x):
     """将各种类型转换为Python内置类型，特别是numpy类型"""
@@ -936,6 +1026,23 @@ def shorten_tool_result(res):
     现在支持自动把 numpy.* 标量转换为 json 可序列化的 builtin。
     """
     res = _to_builtin(res)  # ★ 先做通用转换
+
+    if isinstance(res, dict) and "error" in res:
+        return json.dumps({"error": res["error"]}, ensure_ascii=False)
+    
+    # 处理分位数异常检测结果，确保异常点被正确输出
+    if isinstance(res, dict) and "method" in res and "anomalies" in res:
+        method = res.get("method", "未知方法")
+        anomalies = res.get("anomalies", [])
+        if anomalies:
+            anomaly_summary = f"检测到 {len(anomalies)} 个异常点"
+            if len(anomalies) <= 5:
+                anomaly_summary += f"：{anomalies}"
+            else:
+                anomaly_summary += f"，前5个：{anomalies[:5]}"
+            return f"{method} {anomaly_summary}"
+        else:
+            return f"{method} 未检测到异常"
 
     if isinstance(res, list):
         # 特殊：解析时间表达式的结果
@@ -986,11 +1093,11 @@ def chat(user_query):
     """主对话函数"""
     session_state = {
         "series": None,
-        "selected_methods": None,
         "features": None,
-        "current_detection_results": []
+        "selected_methods": None,
+        "current_detection_results": None,
+        "composite_score": None
     }
-    
     system_prompt = f'''你是一个严格遵守格式规范的用于运维功能，运维数据可视化，运行于生产环境的ReAct智能体，你叫小助手，必须按以下格式处理请求：
 
     你的工具列表如下:
@@ -1038,83 +1145,71 @@ def chat(user_query):
     history.append({"role":"system","content":system_prompt})
     history.append({"role":"user","content": user_query})
 
-    round_num=1
+    round_no=1
     max_round=15
     pending_context = None 
     had_supplement = False
     # 记录原始用户查询
     original_user_query = user_query
 
-    while True:
-        logger.info(f"=== 第{round_num}轮对话 ===")
+    while round_no <= max_round:
+        logger.info(f"=== 第 {round_no} 轮 ===")
 
-        if pending_context:
-            ans = llm_call(pending_context["history"])
-            pending_context = None  
-        else:
-            ans = llm_call(history)
-            
+        # 调 LLM
+        ans = llm_call(history)
         if not ans:
-            logger.error("大模型返回None,结束")
-            return
-
-        logger.info(f"LLM回复: {ans['content'][:200]}...")
-
+            logger.error("LLM 返回空，结束对话")
+            break
+        logger.info(f"LLM 回复: {ans['content'][:200]}…")
         history.append(ans)
-        txt = ans.get("content","")
-        result, done = react(txt, session_state)
 
+        # 处理 LLM 输出
+        result, done = react(ans["content"], session_state)
+
+        # ---------- 补充请求 ----------
         if isinstance(result, dict) and result.get("type") == "supplement":
-            logger.info(f"\n小助手: {result['content']}")
-            try:
-                user_input = input("你: ")
-                if not user_input.strip():
-                    user_input = "默认继续单序列分析"
-            except Exception as e:
-                logger.error(f"无法获取用户输入: {e}")
-                user_input = "默认继续单序列分析"
-            
-            supplement_response = f"对于您的问题 '{result['content']}'，我的回答是: {user_input}"
-            history.append({"role": "user", "content": supplement_response})
-            
-            had_supplement = True
-            round_num += 1
+            print(f"\n小助手: {result['content']}")
+            user_input = input("你: ").strip() or "好的"
+            history.append({"role": "user",
+                            "content": f"补充回答: {user_input}"})
+            round_no += 1
             continue
 
-        short_result = shorten_tool_result(result)
-        history.append({
-            "role":"user",
-            "content": f"<工具调用结果>: {short_result}"
-        })
+        # 把工具返回值写回历史（摘要）
+        short_res = shorten_tool_result(result)
+        history.append({"role": "user",
+                        "content": f"<工具调用结果>: {short_res}"})
 
+        # ---------- 终局 ----------
         if done:
-            logger.info("===最终输出===")
-            logger.info(result)
-            
-            # 最终返回结果前，确保清理MCP资源
-            try:
-                asyncio.run(cleanup_mcp_resources())
-            except Exception as e:
-                logger.error(f"清理MCP资源失败: {e}")
-                
+            logger.info("=== 最终答案 ===")
+            print(result)
+            asyncio.run(cleanup_mcp_resources())
             return result
 
-        round_num+=1
-        if round_num>max_round:
-            logger.warning("超出轮次上限")
-            try:
-                asyncio.run(cleanup_mcp_resources())
-            except Exception as e:
-                logger.error(f"清理MCP资源失败: {e}")
-            return "分析过程超出最大轮次限制，请尝试简化查询或分多次查询。"
-    
-    try:
-        # 最终返回结果前，确保清理MCP资源
-        asyncio.run(cleanup_mcp_resources())
-    except Exception as e:
-        logger.error(f"创建清理任务失败: {e}")
-    
-    return result  
+        round_no += 1
 
+    # 超出轮次
+    logger.warning("超过最大轮次，终止对话")
+    asyncio.run(cleanup_mcp_resources())
+    return "会话结束，未能在限定轮次内完成分析。"
+def init_detection_system():
+    """初始化检测系统，获取可用方法"""
+    logger.info("初始化检测系统，获取可用方法...")
+    try:
+        methods = get_all_detectors()
+        if isinstance(methods, dict) and "error" not in methods:
+            available_methods = list(methods.keys())
+            logger.info(f"可用检测方法: {available_methods}")
+            return True
+        else:
+            error = methods.get("error", "未知错误")
+            logger.error(f"获取检测方法失败: {error}")
+            return False
+    except Exception as e:
+        logger.error(f"初始化检测系统失败: {e}")
+        return False
+    
 if __name__ == '__main__':
+    init_detection_system()
     chat('请分析192.168.0.110这台主机上周星期一的cpu利用率，检测是否有异常')
